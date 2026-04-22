@@ -29,8 +29,10 @@ ProfileParams *p;
 // DRAMLayout 			g_mem_layout = { {{0x2040, 0x44000, 0x88000, 0x110000, 0x220000}, 5}, 0xffffc0000, ((1 << 13) - 1) };
 // DRAMLayout 			g_mem_layout = {{{0x2040,0x24000,0x48000,0x90000},4}, 0xffffe0000, ((1<<13)-1)};
 // DRAMLayout      g_mem_layout = {{{0x4080,0x48000,0x90000,0x120000,0x1b300}, 5}, 0xffffc0000, ROW_SIZE-1};
-DRAMLayout      g_mem_layout = {{{0x4080,0x48000,0x90000,0x120000,0x1b300}, 5}, 0x7ffc0000, ((1 << 13) - 1)};
-
+//DRAMLayout      g_mem_layout = {{{0x4080,0x48000,0x90000,0x120000,0x1b300}, 5}, 0x7ffc0000, ((1 << 13) - 1)};
+DRAMLayout g_mem_layout = {{{0x2040, 0x24000, 0x48000, 0x90000}, 4}, 0xffffe0000, ROW_SIZE-1};
+//DRAMLayout g_mem_layout = {{{0x2040, 0x24000, 0x48000, 0x90000}, 4}, 0x1ffffe0000, ROW_SIZE-1};
+//DRAMLayout 			g_mem_layout = { {{0x2040, 0x44000, 0x88000, 0x110000, 0x220000}, 5}, 0xffffc0000, ((1 << 13) - 1) };
 
 void read_config(SessionConfig * cfg, char *f_name)
 {
@@ -72,6 +74,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "[ERROR] Memory allocation\n");
 		exit(1);
 	}
+	memset(p, 0, sizeof(ProfileParams));
 
 	if(process_argv(argc, argv, p) == -1) {
 		free(p);
@@ -104,7 +107,7 @@ int main(int argc, char **argv)
 		s_cfg.base_off = p->base_off;
 		s_cfg.aggr_n = p->aggr;
 	}
-
+fprintf(stderr, "[DEBUG] fuzzing=%d\n", p->fuzzing);
 	if (p->fuzzing) {
 		fuzzing_session(&s_cfg, &mem);
 	} else {

@@ -53,7 +53,9 @@ physaddr_t get_physaddr(uint64_t v_addr, int pmap_fd)
 
 int phys_cmp(const void *p1, const void *p2)
 {
-	return ((pte_t *) p1)->p_addr - ((pte_t *) p2)->p_addr;
+	physaddr_t a = ((const pte_t *) p1)->p_addr;
+	physaddr_t b = ((const pte_t *) p2)->p_addr;
+	return (a > b) - (a < b);
 }
 
 // WARNING optimization works only with contiguous memory!!

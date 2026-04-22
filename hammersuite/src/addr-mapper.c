@@ -10,18 +10,26 @@ static size_t g_base_row = 0;
 static size_t g_bks = 0;
 static size_t g_rows = 0;
 
-RowMap get_row_map(ADDRMapper * mapper, DRAMAddr * d_addr)
+RowMap get_row_map(ADDRMapper *mapper, DRAMAddr *d_addr)
 {
-	size_t idx =
-	    (d_addr->row - g_base_row) * get_banks_cnt() + d_addr->bank;
-	assert(idx < g_bks * g_rows);
-	return mapper->row_maps[idx];
+    assert(d_addr->row >= g_base_row);
+    assert(d_addr->row < g_base_row + g_rows);
+    assert(d_addr->bank < g_bks);
+
+    size_t idx =
+        (d_addr->row - g_base_row) * g_bks + d_addr->bank;
+
+    return mapper->row_maps[idx];
 }
 
-DRAM_pte get_dram_pte(ADDRMapper * mapper, DRAMAddr * d_addr)
+DRAM_pte get_dram_pte(ADDRMapper *mapper, DRAMAddr *d_addr)
 {
-	RowMap rmap = get_row_map(mapper, d_addr);
-	return rmap.lst[(d_addr->col) >> 6];
+    RowMap rmap = get_row_map(mapper, d_addr);
+
+    size_t c = d_addr->col >> 6;
+    assert(c < rmap.len);
+
+    return rmap.lst[c];
 }
 
 RowMap gen_row_map(DRAMAddr d_src, MemoryBuffer * mem)
@@ -76,8 +84,7 @@ void init_addr_mapper(ADDRMapper * mapper, MemoryBuffer * mem,
 
 void tear_down_addr_mapper(ADDRMapper * mapper)
 {
-	for (int i = 1; i < g_rows * g_bks; i++) {
-		free(mapper->row_maps[i].lst);
-	}
+	for (size_t i = 0; i < g_rows * g_bks; i++)
+    	free(mapper->row_maps[i].lst);
 	free(mapper->row_maps);
 }

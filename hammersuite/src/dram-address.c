@@ -57,7 +57,7 @@ physaddr_t dram_2_phys(DRAMAddr d_addr, MemoryBuffer *mem)
 		uint64_t h_lsb = __builtin_ctzl((g_mem_layout.h_fns.lst[i]) &
 						~(g_mem_layout.col_mask) &
 						~(g_mem_layout.row_mask));
-		p_addr ^= 1 << h_lsb;
+		p_addr ^= 1ULL << h_lsb;
 	}
 	
 	uint64_t physical_base = virt_2_phys(mem->buffer, mem);

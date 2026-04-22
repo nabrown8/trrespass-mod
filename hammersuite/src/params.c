@@ -116,7 +116,7 @@ int process_argv(int argc, char *argv[], ProfileParams *p)
 		{.name = "target-pattern",.has_arg = required_argument,.flag = NULL,.val='T'},
 		{.name = "victim-pattern",.has_arg = required_argument,.flag = NULL,.val = 'V'},
 		{.name = "aggr",.has_arg = required_argument,.flag = NULL,.val='a'},
-		{.name = "fuzzing",.has_arg = no_argument,.flag = &p->fuzzing,.val = 1},
+		{.name = "fuzzing", .has_arg = no_argument, .flag = NULL, .val = 'f'},
 		{.name = "threshold",.has_arg = required_argument,.flag = NULL,.val = 't'},
 		{0, 0, 0, 0}
 	};
@@ -167,8 +167,7 @@ int process_argv(int argc, char *argv[], ProfileParams *p)
 			}
 			break;
 		case 'o':
-			p->g_out_prefix = (char *)malloc(sizeof(char) * strlen(optarg));
-			strncpy(p->g_out_prefix, optarg, strlen(optarg));
+			p->g_out_prefix = strdup(optarg);
 			p->g_flags |= F_EXPORT;
 			break;
 		case 'r':
@@ -181,13 +180,13 @@ int process_argv(int argc, char *argv[], ProfileParams *p)
 			p->aggr = atoi(optarg);
 			break;
 		case 'T':
-			if (str2pat(optarg, &(p->vpat))) {
+			if (str2pat(optarg, &(p->tpat))) {
 				fprintf(stderr, "Invalid target fill pattern: %s\n", optarg);
 				return -1;
 			}
 			break;
 		case 'V':
-			if (str2pat(optarg, &(p->tpat))) {
+			if (str2pat(optarg, &(p->vpat))) {
 				fprintf(stderr, "Invalid victim fill pattern: %s\n", optarg);
 				return -1;
 			}
