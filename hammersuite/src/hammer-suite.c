@@ -19,6 +19,7 @@
 #include <string.h>
 #include <sched.h>
 #include <limits.h>
+#include <time.h>
 #include <math.h>
 
 #define REFRESH_VAL "stdrefi"
@@ -261,7 +262,7 @@ uint64_t hammer_it(HammerPattern* patt, MemoryBuffer* mem) {
 				// fprintf(stderr, "%d\n", t1 - t0);
 			}
 		}
-		for (int rds = 0; rds < 9; rds++) {
+		for (int rds = 0; rds < 1; rds++) {
 		mfence();
 		uint64_t temp = 0;
 			for (size_t j = 0; j < patt->len; j++) {
@@ -648,9 +649,25 @@ static bool try_flip_n(HammerSuite *suite, HammerPattern *h_patt, MemoryBuffer *
         if (ttime == 0) return false;  // treat OOB as failure
 
         if (scan_rows(suite, h_patt, 0)) {
+			for (int idx = 0; idx < h_patt->len; idx++)
+				fill_row(suite, &h_patt->d_lst[idx], cfg->d_cfg, 1);
+
+			for (int idx = 0; idx < h_patt->len - 1; idx++) {
+				size_t row_lo = h_patt->d_lst[idx].row;
+				size_t row_hi = h_patt->d_lst[idx + 1].row;
+				for (size_t dummy_row = row_lo + 1; dummy_row < row_hi; dummy_row++) {
+					DRAMAddr d_dummy = h_patt->d_lst[idx];
+					d_dummy.row = dummy_row;
+					fill_row(suite, &d_dummy, cfg->d_cfg, 1);
+				}
+			}
 			fprintf(stderr, "[DEBUG] flip detected at try %d\n", t);
             return true;  // ANY success → true
 		}
+		struct timespec req;
+		req.tv_sec = 0;
+		req.tv_nsec = 64000000; // sleep for 64 ms
+		nanosleep(&req, NULL);
     }
 
 	// Restore state
@@ -804,7 +821,7 @@ int n_sided_test(HammerSuite * suite)
 	h_patt.d_lst[0] = d_base;
  
 	const int mem_to_hammer = 256 << 20;
-	const int n_rows =  1000; //mem_to_hammer / ((8<<10) *  get_banks_cnt());
+	const int n_rows =  mem_to_hammer / ((8<<10) *  get_banks_cnt());
 	fprintf(stderr, "Hammering %d rows per bank\n", n_rows);
 	for (int r0 = 1; r0 < n_rows; r0++) {
 		h_patt.d_lst[0].row = d_base.row + r0;
@@ -830,6 +847,18 @@ int n_sided_test(HammerSuite * suite)
 			// fill all the aggressor rows
 			for (int idx = 0; idx < cfg->aggr_n; idx++) {
 				fill_row(suite, &h_patt.d_lst[idx], cfg->d_cfg, 0);
+			}
+
+			// Reinitialize victim/dummy rows so each round starts from a known state.
+			for (int idx = 0; idx < h_patt.len - 1; idx++) {
+				size_t row_lo = h_patt.d_lst[idx].row;
+				size_t row_hi = h_patt.d_lst[idx + 1].row;
+				for (size_t dummy_row = row_lo + 1; dummy_row < row_hi; dummy_row++) {
+					if (dummy_row >= suite->mapper->base_row + cfg->h_rows) break;
+					DRAMAddr d_dummy = h_patt.d_lst[idx];
+					d_dummy.row = dummy_row;
+					fill_row(suite, &d_dummy, cfg->d_cfg, 1);
+				}
 			}
  
 			uint64_t time = hammer_it(&h_patt, mem);
@@ -1112,17 +1141,8 @@ void hammer_session(SessionConfig * cfg, MemoryBuffer * memory)
 		}
 	}
  
-	for (int n = 9; n <= 11; n++) {
-    cfg->aggr_n = n;
-	fprintf(stderr,
-    "hammer_test=%p n_sided=%p triple=%p assisted=%p fuzz=%p\n",
-    (void*)suite->hammer_test,
-    (void*)n_sided_test,
-    (void*)free_triple_sided_test,
-    (void*)assisted_double_sided_test,
-    (void*)fuzz);
+
 	suite->hammer_test(suite);
-	}
 	fclose(out_fd);
 	tear_down_addr_mapper(suite->mapper);
 	free(suite);
