@@ -18,6 +18,8 @@
 #include <errno.h>
 #include <string.h>
 #include <sched.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <limits.h>
 #include <time.h>
 #include <math.h>
@@ -226,6 +228,136 @@ int random_int(int min, int max)
 	return number;
 }
 
+typedef struct {
+    char **v_lst;
+    size_t len;
+    int rounds;
+    size_t aggr_cnt;
+    uint64_t act_delay;
+
+    /* --- synchronization --- */
+    pthread_barrier_t barrier_ready;   // both threads ready
+    pthread_barrier_t barrier_start;   // start timing window
+    pthread_barrier_t barrier_stop;    // end timing window
+
+    volatile int shutdown;
+} HammerThreadArgs;
+ 
+static HammerThreadArgs g_hammer_args;
+static pthread_t        g_t_dummy, g_t_aggr;
+static int              g_threads_init = 0;
+ 
+static void *dummy_thread(void *arg)
+{
+    HammerThreadArgs *a = (HammerThreadArgs *)arg;
+
+    while (1) {
+        pthread_barrier_wait(&a->barrier_ready);
+        if (a->shutdown) break;
+
+        pthread_barrier_wait(&a->barrier_start);
+
+        const size_t start = a->aggr_cnt;
+
+        for (int r = 0; r < a->rounds; r++) {
+            mfence();
+
+            for (size_t j = start; j < a->len; j++)
+                (void)*(volatile char *)a->v_lst[j];
+
+            for (size_t j = start; j < a->len; j++)
+                clflushopt(a->v_lst[j]);
+        }
+
+        pthread_barrier_wait(&a->barrier_stop);
+    }
+
+    return NULL;
+}
+ 
+static void *aggressor_thread(void *arg)
+{
+    HammerThreadArgs *a = (HammerThreadArgs *)arg;
+
+    while (1) {
+        pthread_barrier_wait(&a->barrier_ready);
+        if (a->shutdown) break;
+
+        pthread_barrier_wait(&a->barrier_start);
+
+        const uint64_t delay = a->act_delay;
+
+        for (int i = 0; i < a->rounds; i++) {
+
+            mfence();
+
+            for (size_t j = 0; j < a->aggr_cnt; j++) {
+                (void)*(volatile char *)a->v_lst[j];
+
+                if (delay) {
+                    uint64_t t0 = rdtscp();
+                    while ((rdtscp() - t0) < delay)
+                        asm volatile("pause");
+                }
+            }
+
+            for (size_t j = 0; j < a->aggr_cnt; j++)
+                clflushopt(a->v_lst[j]);
+        }
+
+        pthread_barrier_wait(&a->barrier_stop);
+    }
+
+    return NULL;
+}
+
+uint64_t hammer_with_delay(HammerPattern *patt, MemoryBuffer *mem, size_t aggr_cnt)
+{
+    char **v_lst = (char**)malloc(sizeof(char*) * patt->len);
+
+    for (size_t i = 0; i < patt->len; i++)
+        v_lst[i] = phys_2_virt(dram_2_phys(patt->d_lst[i], mem), mem);
+
+    if (!g_threads_init) {
+        pthread_barrier_init(&g_hammer_args.barrier_ready, NULL, 3);
+        pthread_barrier_init(&g_hammer_args.barrier_start, NULL, 3);
+        pthread_barrier_init(&g_hammer_args.barrier_stop,  NULL, 3);
+
+        g_hammer_args.shutdown = 0;
+
+        pthread_create(&g_t_dummy, NULL, dummy_thread, &g_hammer_args);
+        pthread_create(&g_t_aggr,  NULL, aggressor_thread, &g_hammer_args);
+
+        g_threads_init = 1;
+    }
+
+    g_hammer_args.v_lst = v_lst;
+    g_hammer_args.len = patt->len;
+    g_hammer_args.rounds = patt->rounds;
+    g_hammer_args.aggr_cnt = aggr_cnt;
+    g_hammer_args.act_delay = 13200;
+
+    /* ------------------- SYNC PHASE ------------------- */
+
+    // 1. wait both threads ready
+    pthread_barrier_wait(&g_hammer_args.barrier_ready);
+
+    // 2. start timing right before release
+    uint64_t t0 = realtime_now();
+
+    // 3. release both threads
+    pthread_barrier_wait(&g_hammer_args.barrier_start);
+
+    // 4. wait for both threads to finish
+    pthread_barrier_wait(&g_hammer_args.barrier_stop);
+
+    uint64_t t1 = realtime_now();
+
+    free(v_lst);
+
+    return (t1 - t0) / 1000000;
+}
+
 uint64_t hammer_it(HammerPattern* patt, MemoryBuffer* mem) {
 
 	char** v_lst = (char**) malloc(sizeof(char*)*patt->len);
@@ -247,7 +379,7 @@ uint64_t hammer_it(HammerPattern* patt, MemoryBuffer* mem) {
 	}
 
 	sched_yield();
-
+	uint64_t round_in_ns = 6600 / 4; // cycles -> ns, 4 GHz
 	uint64_t cl0, cl1;
 	cl0 = realtime_now();
 	for ( int i = 0; i < patt->rounds;  i++) {
@@ -274,10 +406,14 @@ uint64_t hammer_it(HammerPattern* patt, MemoryBuffer* mem) {
 			}
 			//temp--;
 			asm volatile("sfence" ::: "memory");
+
+		uint64_t next = cl0 + (uint64_t)(i + 1) * round_in_ns;
+    	while (realtime_now() < next)
+       		asm volatile("pause");
 		}
 	}
 	cl1 = realtime_now();
-
+	usleep(100000); // sleep for 100 ms to ensure no accumulation
 	free(v_lst);
 	return (cl1-cl0) / patt->rounds;
 
@@ -924,6 +1060,145 @@ int n_sided_test(HammerSuite * suite)
 	return 0;
 }
 
+int staggered_hammer(HammerSuite *suite,
+                      const DRAMAddr *targets,
+                      size_t target_cnt)
+{
+    MemoryBuffer   *mem = suite->mem;
+    SessionConfig  *cfg = suite->cfg;
+
+    HammerPattern h_patt;
+
+    if (target_cnt == 0)
+        return 0;
+
+    h_patt.len    = cfg->aggr_n;
+    h_patt.rounds = cfg->h_rounds;
+    h_patt.d_lst  = (DRAMAddr *)malloc(sizeof(DRAMAddr) * h_patt.len);
+
+    if (!h_patt.d_lst)
+        return 0;
+
+    memset(h_patt.d_lst, 0, sizeof(DRAMAddr) * h_patt.len);
+
+    init_chunk(suite);
+    fprintf(stderr, "CL_SEED: %lx\n", CL_SEED);
+
+    /*
+     * Slide a window of aggr_n entries across the user-supplied list.
+     *
+     * Example:
+     * if aggr_n = 3 and targets = [A B C D E]
+     * patterns tested:
+     *   A B C
+     *   B C D
+     *   C D E
+     *
+     * If you want non-overlapping groups instead, replace start_idx++
+     * with start_idx += cfg->aggr_n
+     */
+    for (size_t start_idx = 0;
+         start_idx + cfg->aggr_n <= target_cnt;
+         start_idx++)
+    {
+        for (int i = 0; i < cfg->aggr_n; i++)
+            h_patt.d_lst[i] = targets[start_idx + i];
+
+        fprintf(stderr, "[HAMMER] - %s: ",
+                hPatt_2_str(&h_patt, ROW_FIELD));
+
+#ifdef FLIPTABLE
+        print_start_attack(&h_patt);
+#endif
+
+        /*
+         * Fill aggressor rows with aggressor pattern
+         */
+        for (int idx = 0; idx < h_patt.len; idx++)
+            fill_row(suite, &h_patt.d_lst[idx], cfg->d_cfg, 0);
+
+        /*
+         * Fill rows between aggressors as victims/dummies
+         * (only if same bank and increasing rows)
+         */
+        for (int idx = 0; idx < h_patt.len - 1; idx++) {
+
+            DRAMAddr lo = h_patt.d_lst[idx];
+            DRAMAddr hi = h_patt.d_lst[idx + 1];
+
+            if (lo.bank != hi.bank)
+                continue;
+
+            if (hi.row <= lo.row + 1)
+                continue;
+
+            for (size_t dummy_row = lo.row + 1;
+                 dummy_row < hi.row;
+                 dummy_row++)
+            {
+                DRAMAddr d_dummy = lo;
+                d_dummy.row = dummy_row;
+
+                fill_row(suite, &d_dummy, cfg->d_cfg, 1);
+            }
+        }
+
+        /*
+         * CHANGE #1:
+         * Use hammer_with_delay instead of hammer_it
+         */
+		for (int i = 0; i < 50; i++) {
+			uint64_t time = hammer_with_delay(&h_patt, mem, 2);
+			fprintf(stderr, "%lu ", time);
+
+			h_patt.rounds = cfg->h_rounds;
+
+			bool flipped = scan_rows(suite, &h_patt, 0);
+
+        }
+
+#ifdef FLIPTABLE
+        print_end_attack();
+#endif
+
+        fprintf(stderr, "\n");
+    }
+
+    free(h_patt.d_lst);
+	return 0;
+}
+
+int staggered_hammer_wrapper(HammerSuite *suite)
+{
+	DRAMAddr targets[] = {
+		//{.bank = 14, .row = 61775},
+		{.bank = 14, .row = 61777},
+		{.bank = 14, .row = 61779},
+		{.bank = 14, .row = 61781},
+		{.bank = 14, .row = 61783},
+		{.bank = 14, .row = 61785},
+		{.bank = 14, .row = 61787},
+		{.bank = 14, .row = 61789},
+		{.bank = 14, .row = 61791},
+		{.bank = 14, .row = 61793},
+		{.bank = 14, .row = 61795},
+		{.bank = 14, .row = 61797},
+		{.bank = 14, .row = 61799},
+		{.bank = 14, .row = 61801},
+		{.bank = 14, .row = 61803},
+		{.bank = 14, .row = 61805},
+		{.bank = 14, .row = 61807},
+		{.bank = 14, .row = 61809},
+		{.bank = 14, .row = 61811},
+		{.bank = 14, .row = 61813},
+	};
+
+    return staggered_hammer(
+        suite,
+        targets,
+        sizeof(targets)/sizeof(targets[0]));
+}
+
 void fuzz(HammerSuite *suite, int d, int v)
 {
 	int i;
@@ -1135,6 +1410,9 @@ void hammer_session(SessionConfig * cfg, MemoryBuffer * memory)
 			suite->hammer_test = (int (*)(void *))n_sided_test;
 			break;
 		}
+		case DELAYED:
+			suite->hammer_test = (int (*)(void *))staggered_hammer_wrapper;
+			break;
 		default:
 		{
 			suite->hammer_test = (int (*)(void *))n_sided_test;

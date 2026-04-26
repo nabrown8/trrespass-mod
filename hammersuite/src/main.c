@@ -26,11 +26,11 @@
 ProfileParams *p;
 
 // DRAMLayout     g_mem_layout = {{{0x4080,0x88000,0x110000,0x220000,0x440000,0x4b300}, 6}, 0xffff80000, ((1<<13)-1)};
-// DRAMLayout 			g_mem_layout = { {{0x2040, 0x44000, 0x88000, 0x110000, 0x220000}, 5}, 0xffffc0000, ((1 << 13) - 1) };
+DRAMLayout 			g_mem_layout = { {{0x2040, 0x44000, 0x88000, 0x110000, 0x220000}, 5}, 0xffffc0000, ((1 << 13) - 1) };
 // DRAMLayout 			g_mem_layout = {{{0x2040,0x24000,0x48000,0x90000},4}, 0xffffe0000, ((1<<13)-1)};
 // DRAMLayout      g_mem_layout = {{{0x4080,0x48000,0x90000,0x120000,0x1b300}, 5}, 0xffffc0000, ROW_SIZE-1};
 //DRAMLayout      g_mem_layout = {{{0x4080,0x48000,0x90000,0x120000,0x1b300}, 5}, 0x7ffc0000, ((1 << 13) - 1)};
-DRAMLayout g_mem_layout = {{{0x2040, 0x24000, 0x48000, 0x90000}, 4}, 0xffffe0000, ROW_SIZE-1};
+//DRAMLayout g_mem_layout = {{{0x2040, 0x24000, 0x48000, 0x90000}, 4}, 0xffffe0000, ROW_SIZE-1};
 //DRAMLayout g_mem_layout = {{{0x2040, 0x24000, 0x48000, 0x90000}, 4}, 0x1ffffe0000, ROW_SIZE-1};
 //DRAMLayout 			g_mem_layout = { {{0x2040, 0x44000, 0x88000, 0x110000, 0x220000}, 5}, 0xffffc0000, ((1 << 13) - 1) };
 
@@ -102,7 +102,7 @@ int main(int argc, char **argv)
 		// HARDCODED values
 		s_cfg.h_rows = PATT_LEN;
 		s_cfg.h_rounds = p->rounds;
-		s_cfg.h_cfg = N_SIDED;
+		s_cfg.h_cfg = DELAYED;
 		s_cfg.d_cfg = RANDOM;
 		s_cfg.base_off = p->base_off;
 		s_cfg.aggr_n = p->aggr;
