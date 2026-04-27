@@ -240,6 +240,8 @@ typedef struct {
     pthread_barrier_t barrier_start;   // start timing window
     pthread_barrier_t barrier_stop;    // end timing window
 
+	volatile int aggr_done; // signals when aggressor is done w work
+
     volatile int shutdown;
 } HammerThreadArgs;
  
@@ -256,19 +258,22 @@ static void *dummy_thread(void *arg)
         if (a->shutdown) break;
 
         pthread_barrier_wait(&a->barrier_start);
-
+		int ctr = 0;
         const size_t start = a->aggr_cnt;
-
-        for (int r = 0; r < a->rounds; r++) {
+        while (!a->aggr_done) {
             mfence();
-
+			ctr++;
             for (size_t j = start; j < a->len; j++)
                 (void)*(volatile char *)a->v_lst[j];
 
-            for (size_t j = start; j < a->len; j++)
+            for (size_t j = start; j < a->len; j++) // flush EVERY addr here, not just aggr
                 clflushopt(a->v_lst[j]);
-        }
 
+			uint64_t t0 = rdtscp();
+			while ((rdtscp() - t0) < 6000) // cycle delay
+				asm volatile("pause");
+        }
+		printf("looped dummies: %ld\n", ctr);
         pthread_barrier_wait(&a->barrier_stop);
     }
 
@@ -294,16 +299,22 @@ static void *aggressor_thread(void *arg)
             for (size_t j = 0; j < a->aggr_cnt; j++) {
                 (void)*(volatile char *)a->v_lst[j];
 
-                if (delay) {
-                    uint64_t t0 = rdtscp();
-                    while ((rdtscp() - t0) < delay)
-                        asm volatile("pause");
-                }
+                // if (delay) {
+                //     uint64_t t0 = rdtscp();
+                //     while ((rdtscp() - t0) < delay)
+                //         asm volatile("pause");
+                // }
             }
 
             for (size_t j = 0; j < a->aggr_cnt; j++)
                 clflushopt(a->v_lst[j]);
+
+			uint64_t t0 = rdtscp();
+				while ((rdtscp() - t0) < delay)
+					asm volatile("pause");
         }
+
+		a->aggr_done = 1; // stop the dummy
 
         pthread_barrier_wait(&a->barrier_stop);
     }
@@ -314,7 +325,6 @@ static void *aggressor_thread(void *arg)
 uint64_t hammer_with_delay(HammerPattern *patt, MemoryBuffer *mem, size_t aggr_cnt)
 {
     char **v_lst = (char**)malloc(sizeof(char*) * patt->len);
-
     for (size_t i = 0; i < patt->len; i++)
         v_lst[i] = phys_2_virt(dram_2_phys(patt->d_lst[i], mem), mem);
 
@@ -322,39 +332,44 @@ uint64_t hammer_with_delay(HammerPattern *patt, MemoryBuffer *mem, size_t aggr_c
         pthread_barrier_init(&g_hammer_args.barrier_ready, NULL, 3);
         pthread_barrier_init(&g_hammer_args.barrier_start, NULL, 3);
         pthread_barrier_init(&g_hammer_args.barrier_stop,  NULL, 3);
-
         g_hammer_args.shutdown = 0;
+        g_hammer_args.aggr_done = 0;
 
-        pthread_create(&g_t_dummy, NULL, dummy_thread, &g_hammer_args);
         pthread_create(&g_t_aggr,  NULL, aggressor_thread, &g_hammer_args);
+        pthread_create(&g_t_dummy, NULL, dummy_thread,     &g_hammer_args);
+
+        // Pin aggressor to core 0, dummy to core 1, main to core 2
+        cpu_set_t cpuset;
+
+        CPU_ZERO(&cpuset);
+        CPU_SET(0, &cpuset);
+        pthread_setaffinity_np(g_t_aggr, sizeof(cpu_set_t), &cpuset);
+
+        CPU_ZERO(&cpuset);
+        CPU_SET(1, &cpuset);
+        pthread_setaffinity_np(g_t_dummy, sizeof(cpu_set_t), &cpuset);
+
+        CPU_ZERO(&cpuset);
+        CPU_SET(2, &cpuset);
+        sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
 
         g_threads_init = 1;
     }
 
-    g_hammer_args.v_lst = v_lst;
-    g_hammer_args.len = patt->len;
-    g_hammer_args.rounds = patt->rounds;
-    g_hammer_args.aggr_cnt = aggr_cnt;
-    g_hammer_args.act_delay = 13200;
+    g_hammer_args.v_lst     = v_lst;
+    g_hammer_args.len       = patt->len;
+    g_hammer_args.rounds    = patt->rounds;
+    g_hammer_args.aggr_cnt  = aggr_cnt;
+    g_hammer_args.act_delay = 6600;
 
-    /* ------------------- SYNC PHASE ------------------- */
-
-    // 1. wait both threads ready
     pthread_barrier_wait(&g_hammer_args.barrier_ready);
-
-    // 2. start timing right before release
+    g_hammer_args.aggr_done = 0;
     uint64_t t0 = realtime_now();
-
-    // 3. release both threads
     pthread_barrier_wait(&g_hammer_args.barrier_start);
-
-    // 4. wait for both threads to finish
     pthread_barrier_wait(&g_hammer_args.barrier_stop);
-
     uint64_t t1 = realtime_now();
 
     free(v_lst);
-
     return (t1 - t0) / 1000000;
 }
 
@@ -400,6 +415,8 @@ uint64_t hammer_it(HammerPattern* patt, MemoryBuffer* mem) {
 			for (size_t j = 0; j < patt->len; j++) {
 				*(volatile char*) v_lst[j];
 				//temp += *(volatile uint8_t*) v_lst[j];
+				// for (volatile int k = 0; k < 25; k++)
+				// 	asm volatile("nop");
 			}
 			for (size_t j = 0; j < patt->len; j++) {
 				clflushopt(v_lst[j]);
@@ -407,9 +424,9 @@ uint64_t hammer_it(HammerPattern* patt, MemoryBuffer* mem) {
 			//temp--;
 			asm volatile("sfence" ::: "memory");
 
-		uint64_t next = cl0 + (uint64_t)(i + 1) * round_in_ns;
-    	while (realtime_now() < next)
-       		asm volatile("pause");
+		// uint64_t next = cl0 + (uint64_t)(i + 1) * round_in_ns;
+    	// while (realtime_now() < next)
+       	// 	asm volatile("pause");
 		}
 	}
 	cl1 = realtime_now();
@@ -826,113 +843,12 @@ static bool try_flip_n(HammerSuite *suite, HammerPattern *h_patt, MemoryBuffer *
 
 int free_triple_sided_test(HammerSuite * suite)
 {
-	MemoryBuffer *mem = suite->mem;
-	SessionConfig *cfg = suite->cfg;
-
-	DRAMAddr d_base = suite->d_base;
-	d_base.col = 0;
-	HammerPattern h_patt;
-
-	h_patt.len = 3;
-	h_patt.rounds = cfg->h_rounds;
-
-	h_patt.d_lst = (DRAMAddr *) malloc(sizeof(DRAMAddr) * h_patt.len);
-	memset(h_patt.d_lst, 0x00, sizeof(DRAMAddr) * h_patt.len);
-
-	init_chunk(suite);
-	fprintf(stderr, "CL_SEED: %lx\n", CL_SEED);
-
-	h_patt.d_lst[0] = d_base;
-	for (int r0 = 1; r0 < cfg->h_rows; r0++) {
-		for (int r1 = r0; r1 < cfg->h_rows; r1++) {
-			if (r0 == r1)
-				continue;
-
-			h_patt.d_lst[1].row = h_patt.d_lst[0].row + r0;
-			h_patt.d_lst[2].row = h_patt.d_lst[0].row + r1;
-			h_patt.d_lst[0].bank = 0;
-			h_patt.d_lst[1].bank = 0;
-			h_patt.d_lst[2].bank = 0;
-			fprintf(stderr, "[HAMMER] - %s: ", hPatt_2_str(&h_patt, ROW_FIELD));
-			for (size_t bk = 0; bk < get_banks_cnt(); bk++) {
-				h_patt.d_lst[0].bank = bk;
-				h_patt.d_lst[1].bank = bk;
-				h_patt.d_lst[2].bank = bk;
-				// fill all the aggressor rows
-				for (int idx = 0; idx < 3; idx++) {
-					fill_row(suite, &h_patt.d_lst[idx], cfg->d_cfg, 0);
-				}
-				uint64_t time = hammer_it(&h_patt, mem);
-				fprintf(stderr, "%ld ", time);
-
-				scan_rows(suite, &h_patt, 0);
-				for (int idx = 0; idx < 3; idx++) {
-					fill_row(suite, &h_patt.d_lst[idx], cfg->d_cfg, 1);
-				}
-			}
-			fprintf(stderr, "\n");
-		}
-	}
-	free(h_patt.d_lst);
+	return 0;
 }
 
 int assisted_double_sided_test(HammerSuite * suite)
 {
-	MemoryBuffer *mem = suite->mem;
-	SessionConfig *cfg = suite->cfg;
-	DRAMAddr d_base = suite->d_base;
-	d_base.col = 0;
-
-	HammerPattern h_patt;
-
-	h_patt.len = 3;
-	h_patt.rounds = cfg->h_rounds;
-
-	h_patt.d_lst = (DRAMAddr *) malloc(sizeof(DRAMAddr) * h_patt.len);
-	memset(h_patt.d_lst, 0x00, sizeof(DRAMAddr) * h_patt.len);
-
-	init_chunk(suite);
-	fprintf(stderr, "CL_SEED: %lx\n", CL_SEED);
-	h_patt.d_lst[0] = d_base;
-
-	for (int r0 = 1; r0 < cfg->h_rows; r0++) {
-		h_patt.d_lst[1].row = d_base.row + r0;
-		h_patt.d_lst[2].row = h_patt.d_lst[1].row + 2;
-		h_patt.d_lst[0].row =
-		    d_base.row + get_rnd_int(0, cfg->h_rows - 1);
-		while (h_patt.d_lst[0].row == h_patt.d_lst[1].row
-		       || h_patt.d_lst[0].row == h_patt.d_lst[2].row)
-			h_patt.d_lst[0].row =
-			    d_base.row + get_rnd_int(0, cfg->h_rows - 1);
-
-		if (h_patt.d_lst[2].row >= d_base.row + cfg->h_rows)
-			break;
-
-		h_patt.d_lst[0].bank = 0;
-		h_patt.d_lst[1].bank = 0;
-		h_patt.d_lst[2].bank = 0;
-		fprintf(stderr, "[HAMMER] - %s: ", hPatt_2_str(&h_patt, ROW_FIELD));
-		for (size_t bk = 0; bk < get_banks_cnt(); bk++) {
-			h_patt.d_lst[0].bank = bk;
-			h_patt.d_lst[1].bank = bk;
-			h_patt.d_lst[2].bank = bk;
-			// fill all the aggressor rows
-			for (int idx = 0; idx < 3; idx++) {
-				fill_row(suite, &h_patt.d_lst[idx], cfg->d_cfg, 0);
-				// fprintf(stderr, "d_addr: %s\n", dram_2_str(&h_patt.d_lst[idx]));
-			}
-			// fprintf(stderr, "d_addr: %s\n", dram_2_str(&h_patt.d_lst[idx]));
-			uint64_t time = hammer_it(&h_patt, mem);
-			fprintf(stderr, "%ld ", time);
-
-			scan_rows(suite, &h_patt, 0);
-			for (int idx = 0; idx<3; idx++) {
-				fill_row(suite, &h_patt.d_lst[idx], cfg->d_cfg, 1);
-			}
-		}
-		fprintf(stderr, "\n");
-	}
-	free(h_patt.d_lst);
+	return 0;
 }
 
 int n_sided_test(HammerSuite * suite)
@@ -955,20 +871,126 @@ int n_sided_test(HammerSuite * suite)
 	fprintf(stderr, "CL_SEED: %lx\n", CL_SEED);
  
 	h_patt.d_lst[0] = d_base;
+	bool static_hammer = true;
+	if (static_hammer) {
+		DRAMAddr targets[] = {
+			{.bank = 14, .row = 61777},
+			{.bank = 14, .row = 61779},
+			{.bank = 14, .row = 61791},
+			{.bank = 14, .row = 61793},
+			{.bank = 14, .row = 61795},
+			{.bank = 14, .row = 61797},
+			{.bank = 14, .row = 61799},
+			{.bank = 14, .row = 61801},
+			{.bank = 14, .row = 61803},
+			{.bank = 14, .row = 61805},
+			{.bank = 14, .row = 61807},
+			{.bank = 14, .row = 61809},
+			{.bank = 14, .row = 61811},
+			{.bank = 14, .row = 61813},
+			{.bank = 14, .row = 61815},
+			{.bank = 14, .row = 61817},
+			{.bank = 14, .row = 61819},
+			{.bank = 14, .row = 61821},
+			{.bank = 14, .row = 61823},
+		};
+		h_patt.len = sizeof(targets) / sizeof(targets[0]);
+		h_patt.rounds = cfg->h_rounds;
+
+		h_patt.d_lst = (DRAMAddr*) malloc(sizeof(DRAMAddr) * h_patt.len);
+		memcpy(h_patt.d_lst, targets, sizeof(targets));
+		#ifdef FLIPTABLE
+				print_start_attack(&h_patt);
+		#endif
+			// fill all the aggressor rows
+			for (int idx = 0; idx < cfg->aggr_n; idx++) {
+				fill_row(suite, &h_patt.d_lst[idx], cfg->d_cfg, 0);
+			}
+
+			// Reinitialize victim/dummy rows so each round starts from a known state.
+			for (int idx = 0; idx < h_patt.len - 1; idx++) {
+				size_t row_lo = h_patt.d_lst[idx].row;
+				size_t row_hi = h_patt.d_lst[idx + 1].row;
+				for (size_t dummy_row = row_lo + 1; dummy_row < row_hi; dummy_row++) {
+					if (dummy_row >= suite->mapper->base_row + cfg->h_rows) break;
+					DRAMAddr d_dummy = h_patt.d_lst[idx];
+					d_dummy.row = dummy_row;
+					fill_row(suite, &d_dummy, cfg->d_cfg, 1);
+				}
+			}
  
-	const int mem_to_hammer = 256 << 20;
-	const int n_rows =  mem_to_hammer / ((8<<10) *  get_banks_cnt());
-	fprintf(stderr, "Hammering %d rows per bank\n", n_rows);
-	for (int r0 = 1; r0 < n_rows; r0++) {
-		h_patt.d_lst[0].row = d_base.row + r0;
-		int k = 1;
-		for (; k < cfg->aggr_n; k++) {
-			int stride = (k == cfg->aggr_n - 1) ? 2 : 2;
-			h_patt.d_lst[k].row = h_patt.d_lst[k - 1].row + stride;
-			h_patt.d_lst[k].bank = 0;
+			uint64_t time = hammer_it(&h_patt, mem);
+			fprintf(stderr, "%ld ", time);
+ 
+			h_patt.rounds = cfg->h_rounds;
+			bool flipped = scan_rows(suite, &h_patt, 0);
+ 
+			// refill aggressors and dummies
+			for (int idx = 0; idx < h_patt.len; idx++)
+				fill_row(suite, &h_patt.d_lst[idx], cfg->d_cfg, 1);
+			for (int idx = 0; idx < h_patt.len - 1; idx++) {
+				size_t row_lo = h_patt.d_lst[idx].row;
+				size_t row_hi = h_patt.d_lst[idx + 1].row;
+				for (size_t dummy_row = row_lo + 1; dummy_row < row_hi; dummy_row++) {
+					if (dummy_row >= suite->mapper->base_row + cfg->h_rows) break;
+					DRAMAddr d_dummy = h_patt.d_lst[idx];
+					d_dummy.row = dummy_row;
+					fill_row(suite, &d_dummy, cfg->d_cfg, 1);
+				}
+			}
+ 
+			if (flipped) {
+
+			size_t low = 1;
+			size_t high = cfg->h_rounds;
+
+			while ((high - low) > BIN_THRESH) {
+
+				size_t mid = (low + high) / 2;
+				h_patt.rounds = mid;
+
+				bool success = try_flip_n(suite, &h_patt, mem);
+
+				fprintf(stderr,
+					"[BIN] aggr=%s low=%zu mid=%zu high=%zu result=%d\n",
+					hPatt_2_str(&h_patt, ROW_FIELD),
+					low, mid, high, success);
+
+				if (success)
+					high = mid;
+				else
+					low = mid + 1;
+			}
+
+			fprintf(out_fd,
+				"[THRESH] min_rounds~%zu (+/-%d) aggr=%s\n",
+				high,
+				BIN_THRESH,
+				hPatt_2_str(&h_patt, ROW_FIELD)
+				);
+
+			h_patt.rounds = cfg->h_rounds;
 		}
-		if (h_patt.d_lst[k - 1].row >= d_base.row + cfg->h_rows)
-			break;
+ 
+	#ifdef FLIPTABLE
+		print_end_attack();
+	#endif
+		fprintf(stderr, "\n");
+	}
+	else {
+		const int mem_to_hammer = 256 << 20;
+		const int n_rows =  mem_to_hammer / ((8<<10) *  get_banks_cnt());
+		fprintf(stderr, "Hammering %d rows per bank\n", n_rows);
+		for (int r0 = 1; r0 < n_rows; r0++) {
+			h_patt.d_lst[0].row = d_base.row + r0;
+			int k = 1;
+			for (; k < cfg->aggr_n; k++) {
+				int stride = (k == cfg->aggr_n - 1) ? 2 : 2;
+				h_patt.d_lst[k].row = h_patt.d_lst[k - 1].row + stride;
+				h_patt.d_lst[k].bank = 0;
+			}
+			if (h_patt.d_lst[k - 1].row >= d_base.row + cfg->h_rows)
+				break;
  
 		fprintf(stderr, "[HAMMER] - %s: ", hPatt_2_str(&h_patt, ROW_FIELD));
 		for (size_t bk = 0; bk < get_banks_cnt(); bk++) {
@@ -1055,6 +1077,7 @@ int n_sided_test(HammerSuite * suite)
 #endif
 		}
 		fprintf(stderr, "\n");
+		}
 	}
 	free(h_patt.d_lst);
 	return 0;
@@ -1148,10 +1171,9 @@ int staggered_hammer(HammerSuite *suite,
          * Use hammer_with_delay instead of hammer_it
          */
 		for (int i = 0; i < 50; i++) {
+			h_patt.rounds = cfg->h_rounds;
 			uint64_t time = hammer_with_delay(&h_patt, mem, 2);
 			fprintf(stderr, "%lu ", time);
-
-			h_patt.rounds = cfg->h_rounds;
 
 			bool flipped = scan_rows(suite, &h_patt, 0);
 
@@ -1174,11 +1196,6 @@ int staggered_hammer_wrapper(HammerSuite *suite)
 		//{.bank = 14, .row = 61775},
 		{.bank = 14, .row = 61777},
 		{.bank = 14, .row = 61779},
-		{.bank = 14, .row = 61781},
-		{.bank = 14, .row = 61783},
-		{.bank = 14, .row = 61785},
-		{.bank = 14, .row = 61787},
-		{.bank = 14, .row = 61789},
 		{.bank = 14, .row = 61791},
 		{.bank = 14, .row = 61793},
 		{.bank = 14, .row = 61795},
@@ -1191,7 +1208,41 @@ int staggered_hammer_wrapper(HammerSuite *suite)
 		{.bank = 14, .row = 61809},
 		{.bank = 14, .row = 61811},
 		{.bank = 14, .row = 61813},
+		{.bank = 14, .row = 61815},
+		{.bank = 14, .row = 61817},
+		{.bank = 14, .row = 61819},
+		{.bank = 14, .row = 61821},
+	    {.bank = 14, .row = 61823}, // comment out to try 18-sided hammering
+		// {.bank = 14, .row = 61815}, // comment out to try 19-sided hammering
+		// {.bank = 14, .row = 61817}, // comment out to try 20-sided hammering
+		// {.bank = 14, .row = 61819}, // comment out to try 21-sided hammering
+		// {.bank = 14, .row = 61821}, // comment out to try 22-sided hammering
 	};
+
+		// this set of targets tries to push them further away from the target flip
+	// DRAMAddr targets[] = {
+	// 	// //{.bank = 14, .row = 61775},
+	// 	{.bank = 14, .row = 61777},
+	// 	{.bank = 14, .row = 61787},
+	// 	{.bank = 14, .row = 61789},
+	// 	{.bank = 14, .row = 61791},
+	// 	{.bank = 14, .row = 61793},
+	// 	{.bank = 14, .row = 61795},
+	// 	{.bank = 14, .row = 61797},
+	// 	{.bank = 14, .row = 61799},
+	// 	{.bank = 14, .row = 61801},
+	// 	{.bank = 14, .row = 61803},
+	// 	{.bank = 14, .row = 61805},
+	// 	{.bank = 14, .row = 61807},
+	// 	{.bank = 14, .row = 61809},
+	// 	{.bank = 14, .row = 61811},
+	// 	{.bank = 14, .row = 61813},
+	// 	{.bank = 14, .row = 61815},
+	// 	{.bank = 14, .row = 61817},
+	// 	{.bank = 14, .row = 61819},
+	// 	{.bank = 14, .row = 61821}, // comment out to try 18-sided hammering
+	// 	//{.bank = 14, .row = 61815} // comment out to try 19-sided hammering
+	// };
 
     return staggered_hammer(
         suite,
