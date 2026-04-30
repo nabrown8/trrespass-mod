@@ -103,6 +103,51 @@ typedef struct {
 	int (*hammer_test) (void *self);
 } HammerSuite;
 
+static uint64_t measure_tsc_hz(void)
+{
+    struct timespec ts0, ts1;
+    uint64_t tsc0, tsc1;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+    tsc0 = rdtscp();
+    /* sleep ~100ms */
+    struct timespec req = { .tv_sec = 0, .tv_nsec = 100000000 };
+    nanosleep(&req, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    tsc1 = rdtscp();
+
+    uint64_t ns_elapsed = (uint64_t)(ts1.tv_sec  - ts0.tv_sec)  * 1000000000ULL
+                        + (uint64_t)(ts1.tv_nsec - ts0.tv_nsec);
+    uint64_t tsc_elapsed = tsc1 - tsc0;
+
+    /* cycles/sec = tsc_elapsed / (ns_elapsed / 1e9) */
+    return tsc_elapsed * 1000000000ULL / ns_elapsed;
+}
+
+uint64_t count_activations_in_tREFI(char **v_lst, size_t len, uint64_t tsc_hz)
+{
+    const uint64_t TREFI_NS        = 7800ULL;
+    const uint64_t interval_cycles = tsc_hz / 1000000000ULL * TREFI_NS;
+
+    uint64_t count = 0;
+    uint64_t t_end = rdtscp() + interval_cycles;
+
+    while (1) {
+        for (size_t j = 0; j < len; j++) {
+            if (rdtscp() >= t_end)
+                goto done;
+            (void)*(volatile char *)v_lst[j];
+            clflushopt(v_lst[j]);
+            count++;
+        }
+        mfence();
+    }
+done:
+    mfence();
+    printf("activations in 7.8us: %lu\n", count);
+    return count;
+}
+
 bool is_adjacent_to_aggressor(DRAMAddr * d_addr, HammerPattern * h_patt)
 {
 	for (int i = h_patt->len - 2; i < h_patt->len; i++) {
@@ -233,92 +278,84 @@ typedef struct {
     size_t len;
     int rounds;
     size_t aggr_cnt;
-    uint64_t act_delay;
-
+    uint64_t act_delay;       // ~1.66us in TSC cycles
+    uint64_t tsc_freq;        // for calibration
     /* --- synchronization --- */
-    pthread_barrier_t barrier_ready;   // both threads ready
-    pthread_barrier_t barrier_start;   // start timing window
-    pthread_barrier_t barrier_stop;    // end timing window
-
-	volatile int aggr_done; // signals when aggressor is done w work
-
+    pthread_barrier_t barrier_ready;
+    pthread_barrier_t barrier_start;
+    pthread_barrier_t barrier_stop;
     volatile int shutdown;
+    /* --- hot path ping-pong (cache-line aligned to avoid false sharing) --- */
+    volatile int token __attribute__((aligned(64))); // 0=aggressor's turn, 1=dummy's turn
 } HammerThreadArgs;
- 
+
 static HammerThreadArgs g_hammer_args;
 static pthread_t        g_t_dummy, g_t_aggr;
 static int              g_threads_init = 0;
- 
-static void *dummy_thread(void *arg)
-{
-    HammerThreadArgs *a = (HammerThreadArgs *)arg;
-
-    while (1) {
-        pthread_barrier_wait(&a->barrier_ready);
-        if (a->shutdown) break;
-
-        pthread_barrier_wait(&a->barrier_start);
-		int ctr = 0;
-        const size_t start = a->aggr_cnt;
-        while (!a->aggr_done) {
-            mfence();
-			ctr++;
-            for (size_t j = start; j < a->len; j++)
-                (void)*(volatile char *)a->v_lst[j];
-
-            for (size_t j = start; j < a->len; j++) // flush EVERY addr here, not just aggr
-                clflushopt(a->v_lst[j]);
-
-			uint64_t t0 = rdtscp();
-			while ((rdtscp() - t0) < 6000) // cycle delay
-				asm volatile("pause");
-        }
-		printf("looped dummies: %ld\n", ctr);
-        pthread_barrier_wait(&a->barrier_stop);
-    }
-
-    return NULL;
-}
- 
 static void *aggressor_thread(void *arg)
 {
     HammerThreadArgs *a = (HammerThreadArgs *)arg;
-
     while (1) {
         pthread_barrier_wait(&a->barrier_ready);
         if (a->shutdown) break;
-
+        a->token = 0;          // reset before both threads enter hot path
+        mfence();
         pthread_barrier_wait(&a->barrier_start);
 
-        const uint64_t delay = a->act_delay;
-
         for (int i = 0; i < a->rounds; i++) {
-
-            mfence();
-
-            for (size_t j = 0; j < a->aggr_cnt; j++) {
-                (void)*(volatile char *)a->v_lst[j];
-
-                // if (delay) {
-                //     uint64_t t0 = rdtscp();
-                //     while ((rdtscp() - t0) < delay)
-                //         asm volatile("pause");
-                // }
-            }
-
             for (size_t j = 0; j < a->aggr_cnt; j++)
-                clflushopt(a->v_lst[j]);
-
-			uint64_t t0 = rdtscp();
-				while ((rdtscp() - t0) < delay)
-					asm volatile("pause");
+                (void)*(volatile char *)a->v_lst[j];
+            mfence();
+            a->token = 1;
+            while (a->token != 0)
+                asm volatile("pause");
+			asm volatile("sfence" ::: "memory");
         }
 
-		a->aggr_done = 1; // stop the dummy
-
+        a->token = -1;
         pthread_barrier_wait(&a->barrier_stop);
     }
+    return NULL;
+}
 
+static void *dummy_thread(void *arg)
+{
+    HammerThreadArgs *a = (HammerThreadArgs *)arg;
+    while (1) {
+        pthread_barrier_wait(&a->barrier_ready);
+        if (a->shutdown) break;
+        pthread_barrier_wait(&a->barrier_start);
+
+        const uint64_t interval = a->act_delay; // 1.66us in TSC cycles
+
+        while (1) {
+            // wait for aggressor to hand off
+            while (a->token != 1) {
+                if (a->token == -1) goto round_done;
+                asm volatile("pause");
+            }
+
+            uint64_t t0 = rdtscp();
+
+            // access + flush everything (aggressors + dummies)
+            for (size_t j = a->aggr_cnt; j < a->len; j++)
+                (void)*(volatile char *)a->v_lst[j];
+            for (size_t j = 0; j < a->len; j++)
+                clflushopt(a->v_lst[j]);
+            mfence();
+
+            // burn remaining time until 1.66us has elapsed
+            while ((rdtscp() - t0) < interval)
+                asm volatile("pause");
+
+			asm volatile("sfence" ::: "memory");
+            // hand back to aggressor
+            a->token = 0;
+        }
+
+        round_done:
+        pthread_barrier_wait(&a->barrier_stop);
+    }
     return NULL;
 }
 
@@ -327,50 +364,38 @@ uint64_t hammer_with_delay(HammerPattern *patt, MemoryBuffer *mem, size_t aggr_c
     char **v_lst = (char**)malloc(sizeof(char*) * patt->len);
     for (size_t i = 0; i < patt->len; i++)
         v_lst[i] = phys_2_virt(dram_2_phys(patt->d_lst[i], mem), mem);
-
     if (!g_threads_init) {
         pthread_barrier_init(&g_hammer_args.barrier_ready, NULL, 3);
         pthread_barrier_init(&g_hammer_args.barrier_start, NULL, 3);
         pthread_barrier_init(&g_hammer_args.barrier_stop,  NULL, 3);
         g_hammer_args.shutdown = 0;
-        g_hammer_args.aggr_done = 0;
-
         pthread_create(&g_t_aggr,  NULL, aggressor_thread, &g_hammer_args);
         pthread_create(&g_t_dummy, NULL, dummy_thread,     &g_hammer_args);
-
         // Pin aggressor to core 0, dummy to core 1, main to core 2
         cpu_set_t cpuset;
-
         CPU_ZERO(&cpuset);
         CPU_SET(0, &cpuset);
         pthread_setaffinity_np(g_t_aggr, sizeof(cpu_set_t), &cpuset);
-
         CPU_ZERO(&cpuset);
         CPU_SET(1, &cpuset);
         pthread_setaffinity_np(g_t_dummy, sizeof(cpu_set_t), &cpuset);
-
         CPU_ZERO(&cpuset);
         CPU_SET(2, &cpuset);
         sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
-
         g_threads_init = 1;
     }
-
     g_hammer_args.v_lst     = v_lst;
     g_hammer_args.len       = patt->len;
     g_hammer_args.rounds    = patt->rounds;
     g_hammer_args.aggr_cnt  = aggr_cnt;
-    g_hammer_args.act_delay = 6600;
-
+    g_hammer_args.act_delay = 4400;
     pthread_barrier_wait(&g_hammer_args.barrier_ready);
-    g_hammer_args.aggr_done = 0;
     uint64_t t0 = realtime_now();
     pthread_barrier_wait(&g_hammer_args.barrier_start);
     pthread_barrier_wait(&g_hammer_args.barrier_stop);
     uint64_t t1 = realtime_now();
-
     free(v_lst);
-    return (t1 - t0) / 1000000;
+    return (t1 - t0) / patt->rounds;
 }
 
 uint64_t hammer_it(HammerPattern* patt, MemoryBuffer* mem) {
@@ -424,9 +449,9 @@ uint64_t hammer_it(HammerPattern* patt, MemoryBuffer* mem) {
 			//temp--;
 			asm volatile("sfence" ::: "memory");
 
-		// uint64_t next = cl0 + (uint64_t)(i + 1) * round_in_ns;
-    	// while (realtime_now() < next)
-       	// 	asm volatile("pause");
+		uint64_t next = cl0 + (uint64_t)(i + 1) * round_in_ns;
+    	while (realtime_now() < next)
+       		asm volatile("pause");
 		}
 	}
 	cl1 = realtime_now();
@@ -902,43 +927,46 @@ int n_sided_test(HammerSuite * suite)
 		#ifdef FLIPTABLE
 				print_start_attack(&h_patt);
 		#endif
-			// fill all the aggressor rows
-			for (int idx = 0; idx < cfg->aggr_n; idx++) {
-				fill_row(suite, &h_patt.d_lst[idx], cfg->d_cfg, 0);
+			bool flipped = false;
+			for (int attempt = 0; attempt < 50; attempt++) {
+				// fill all the aggressor rows
+				for (int idx = 0; idx < cfg->aggr_n; idx++) {
+					fill_row(suite, &h_patt.d_lst[idx], cfg->d_cfg, 0);
+				}
+
+				// Reinitialize victim/dummy rows so each round starts from a known state.
+				for (int idx = 0; idx < h_patt.len - 1; idx++) {
+					size_t row_lo = h_patt.d_lst[idx].row;
+					size_t row_hi = h_patt.d_lst[idx + 1].row;
+					for (size_t dummy_row = row_lo + 1; dummy_row < row_hi; dummy_row++) {
+						if (dummy_row >= suite->mapper->base_row + cfg->h_rows) break;
+						DRAMAddr d_dummy = h_patt.d_lst[idx];
+						d_dummy.row = dummy_row;
+						fill_row(suite, &d_dummy, cfg->d_cfg, 1);
+					}
+				}
+				uint64_t time = hammer_it(&h_patt, mem);
+				fprintf(stderr, "%ld ", time);
+
+				h_patt.rounds = cfg->h_rounds;
+				if (scan_rows(suite, &h_patt, 0))
+					flipped = true;
+
+				// refill aggressors and dummies
+				for (int idx = 0; idx < h_patt.len; idx++)
+					fill_row(suite, &h_patt.d_lst[idx], cfg->d_cfg, 1);
+				for (int idx = 0; idx < h_patt.len - 1; idx++) {
+					size_t row_lo = h_patt.d_lst[idx].row;
+					size_t row_hi = h_patt.d_lst[idx + 1].row;
+					for (size_t dummy_row = row_lo + 1; dummy_row < row_hi; dummy_row++) {
+						if (dummy_row >= suite->mapper->base_row + cfg->h_rows) break;
+						DRAMAddr d_dummy = h_patt.d_lst[idx];
+						d_dummy.row = dummy_row;
+						fill_row(suite, &d_dummy, cfg->d_cfg, 1);
+					}
+				}
 			}
 
-			// Reinitialize victim/dummy rows so each round starts from a known state.
-			for (int idx = 0; idx < h_patt.len - 1; idx++) {
-				size_t row_lo = h_patt.d_lst[idx].row;
-				size_t row_hi = h_patt.d_lst[idx + 1].row;
-				for (size_t dummy_row = row_lo + 1; dummy_row < row_hi; dummy_row++) {
-					if (dummy_row >= suite->mapper->base_row + cfg->h_rows) break;
-					DRAMAddr d_dummy = h_patt.d_lst[idx];
-					d_dummy.row = dummy_row;
-					fill_row(suite, &d_dummy, cfg->d_cfg, 1);
-				}
-			}
- 
-			uint64_t time = hammer_it(&h_patt, mem);
-			fprintf(stderr, "%ld ", time);
- 
-			h_patt.rounds = cfg->h_rounds;
-			bool flipped = scan_rows(suite, &h_patt, 0);
- 
-			// refill aggressors and dummies
-			for (int idx = 0; idx < h_patt.len; idx++)
-				fill_row(suite, &h_patt.d_lst[idx], cfg->d_cfg, 1);
-			for (int idx = 0; idx < h_patt.len - 1; idx++) {
-				size_t row_lo = h_patt.d_lst[idx].row;
-				size_t row_hi = h_patt.d_lst[idx + 1].row;
-				for (size_t dummy_row = row_lo + 1; dummy_row < row_hi; dummy_row++) {
-					if (dummy_row >= suite->mapper->base_row + cfg->h_rows) break;
-					DRAMAddr d_dummy = h_patt.d_lst[idx];
-					d_dummy.row = dummy_row;
-					fill_row(suite, &d_dummy, cfg->d_cfg, 1);
-				}
-			}
- 
 			if (flipped) {
 
 			size_t low = 1;
