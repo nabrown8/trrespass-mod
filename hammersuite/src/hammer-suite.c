@@ -305,6 +305,8 @@ static void *aggressor_thread(void *arg)
         for (int i = 0; i < a->rounds; i++) {
             for (size_t j = 0; j < a->aggr_cnt; j++)
                 (void)*(volatile char *)a->v_lst[j];
+			for (size_t j = 0; j < a->aggr_cnt; j++)
+                clflushopt(a->v_lst[j]);
             mfence();
             a->token = 1;
             while (a->token != 0)
@@ -340,7 +342,7 @@ static void *dummy_thread(void *arg)
             // access + flush everything (aggressors + dummies)
             for (size_t j = a->aggr_cnt; j < a->len; j++)
                 (void)*(volatile char *)a->v_lst[j];
-            for (size_t j = 0; j < a->len; j++)
+            for (size_t j = a->aggr_cnt; j < a->len; j++)
                 clflushopt(a->v_lst[j]);
             mfence();
 
@@ -388,7 +390,7 @@ uint64_t hammer_with_delay(HammerPattern *patt, MemoryBuffer *mem, size_t aggr_c
     g_hammer_args.len       = patt->len;
     g_hammer_args.rounds    = patt->rounds;
     g_hammer_args.aggr_cnt  = aggr_cnt;
-    g_hammer_args.act_delay = 4400;
+    g_hammer_args.act_delay = 10000;
     pthread_barrier_wait(&g_hammer_args.barrier_ready);
     uint64_t t0 = realtime_now();
     pthread_barrier_wait(&g_hammer_args.barrier_start);
