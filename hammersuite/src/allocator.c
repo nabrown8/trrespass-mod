@@ -47,13 +47,13 @@ int alloc_buffer(MemoryBuffer * mem)
 
 	char* temp = (char *)mmap(NULL, mem->size, PROT_READ | PROT_WRITE,
 				   alloc_flags, mem->fd, 0); // map 1GB to get out of the way
+	munmap(temp, mem->size);
 	mem->buffer = (char *)mmap(NULL, mem->size, PROT_READ | PROT_WRITE,
 				   alloc_flags, mem->fd, 0);
 	if (mem->buffer == MAP_FAILED) {
 		perror("[ERROR] - mmap() failed");
 		exit(1);
 	}
-	munmap(temp, mem->size);
 	if (mem->align) {
 		size_t error = (uint64_t) mem->buffer % mem->align;
 		size_t left = error ? mem->align - error : 0;

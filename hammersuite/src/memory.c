@@ -109,16 +109,7 @@ char *phys_2_virt(physaddr_t p_addr, MemoryBuffer * mem)
 	if (res_pte == NULL)
 		return (char *)NOT_FOUND;
 
-    uint64_t physical_base = get_physaddr((uint64_t)mem->buffer, pmap_fd);
-
-	// fprintf(stderr, "phy_base: %lx\n", physical_base);
-
 	return (char *)((uint64_t) res_pte->
 			v_addr | ((uint64_t) p_addr &
 				  (((uint64_t) PAGE_SIZE - 1))));
-	// assert(false);
-
-    // return (char *)((physical_base & ~(((uint64_t) PAGE_SIZE - 1))) | ((uint64_t) p_addr & (((uint64_t) PAGE_SIZE - 1))));
-
-
 }

@@ -51,6 +51,22 @@
 
 #define SHADOW_FLAGS (MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE)
 #define DEBUG
+
+#ifdef DEBUG
+// when set, hugepage_sweep_test/sweep_current_mapper only hammers this
+// fixed set of row offsets in this fixed bank, instead of sweeping every
+// row/bank in the hugepage. Offsets are added to whatever base row the
+// current hugepage resolves to (suite->d_base.row, recomputed per-hugepage
+// from phys_2_dram), so e.g. 11 always means "base_row+11" even if the
+// row-mapping functions change what base row gets reported.
+#define DEBUG_BANK 16
+static const size_t DEBUG_ROW_OFFSETS[] = { 11, 12 };
+#define DEBUG_ROW_OFFSETS_CNT (sizeof(DEBUG_ROW_OFFSETS) / sizeof(DEBUG_ROW_OFFSETS[0]))
+// which hugepage (1-indexed, matching the "[SWEEP] hugepage N/M" log lines)
+// hugepage_sweep_test should hammer; 0 disables the filter (all hugepages).
+#define DEBUG_HUGEPAGE 7
+#endif
+
 #define ROUND_STEP 2000
 #define THRESH_TRIES 20
 
@@ -219,8 +235,21 @@ void print_end_attack()
 	fflush(out_fd);
 }
 
+#ifdef DEBUG
+// remembers the DRAMAddr of the most recently exported flip, so callers can
+// look up its physical address (e.g. next to a "[THRESH] min_rounds~" line)
+// without threading a return value through scan_rows/scan_stripe/scan_random.
+static DRAMAddr g_last_flip_d_addr;
+static bool g_last_flip_valid = false;
+#endif
+
 void export_flip(FlipVal * flip)
 {
+#ifdef DEBUG
+	g_last_flip_d_addr = flip->d_vict;
+	g_last_flip_valid = true;
+#endif
+
 	if (p->g_flags & F_VERBOSE) {
 		fprintf(stdout, "[FLIP] - (%02x => %02x)\t vict: %s \taggr: %s \n",
 				flip->f_og, flip->f_new, dAddr_2_str(flip->d_vict, ALL_FIELDS),
@@ -421,7 +450,7 @@ uint64_t hammer_it(HammerPattern* patt, MemoryBuffer* mem) {
 	}
 
 	sched_yield();
-	uint64_t round_in_ns = 6600 / 4; // cycles -> ns, 4 GHz
+	uint64_t round_in_ns = 0;//6600 / 4; // cycles -> ns, 4 GHz
 	uint64_t cl0, cl1;
 	cl0 = realtime_now();
 	for ( int i = 0; i < patt->rounds;  i++) {
@@ -451,9 +480,9 @@ uint64_t hammer_it(HammerPattern* patt, MemoryBuffer* mem) {
 			//temp--;
 			asm volatile("sfence" ::: "memory");
 
-		uint64_t next = cl0 + (uint64_t)(i + 1) * round_in_ns;
-    	while (realtime_now() < next)
-       		asm volatile("pause");
+		// uint64_t next = cl0 + (uint64_t)(i + 1) * round_in_ns;
+    	// while (realtime_now() < next)
+       	// 	asm volatile("pause");
 		}
 	}
 	cl1 = realtime_now();
@@ -868,6 +897,196 @@ static bool try_flip_n(HammerSuite *suite, HammerPattern *h_patt, MemoryBuffer *
     return false;  // 0/20 flips
 }
 
+// Sweeps every row covered by suite->mapper (cfg->h_rows), across every bank,
+// building an aggr_n-wide / stride-2 pattern starting at each row offset.
+// Used by hugepage_sweep_test to sample as much of the current hugepage's
+// mapped row range as possible.
+static void sweep_current_mapper(HammerSuite *suite)
+{
+	MemoryBuffer *mem = suite->mem;
+	SessionConfig *cfg = suite->cfg;
+	DRAMAddr d_base = suite->d_base;
+	d_base.col = 0;
+
+	HammerPattern h_patt;
+	h_patt.len = cfg->aggr_n;
+	h_patt.rounds = cfg->h_rounds;
+	h_patt.d_lst = (DRAMAddr *) malloc(sizeof(DRAMAddr) * h_patt.len);
+	memset(h_patt.d_lst, 0x00, sizeof(DRAMAddr) * h_patt.len);
+
+	init_chunk(suite);
+	fprintf(stderr, "CL_SEED: %lx\n", CL_SEED);
+
+	h_patt.d_lst[0] = d_base;
+
+	size_t n_rows = cfg->h_rows;
+	fprintf(stderr, "Hammering %zu rows per bank\n", n_rows);
+#ifdef DEBUG
+	size_t n_r0 = DEBUG_ROW_OFFSETS_CNT;
+#else
+	size_t n_r0 = n_rows > 0 ? n_rows - 1 : 0;
+#endif
+	for (size_t i = 0; i < n_r0; i++) {
+#ifdef DEBUG
+		size_t r0 = DEBUG_ROW_OFFSETS[i];
+#else
+		size_t r0 = i + 1;
+#endif
+		h_patt.d_lst[0].row = d_base.row + r0;
+		int k = 1;
+		for (; k < cfg->aggr_n; k++) {
+			int stride = 2;
+			h_patt.d_lst[k].row = h_patt.d_lst[k - 1].row + stride;
+			h_patt.d_lst[k].bank = 0;
+		}
+		if (h_patt.d_lst[k - 1].row >= d_base.row + cfg->h_rows)
+			break;
+
+		fprintf(stderr, "[HAMMER] - %s: ", hPatt_2_str(&h_patt, ROW_FIELD));
+		for (size_t bk = 0; bk < get_banks_cnt(); bk++) {
+#ifdef DEBUG
+			if (bk != DEBUG_BANK)
+				continue;
+#endif
+
+			for (int s = 0; s < cfg->aggr_n; s++) {
+				h_patt.d_lst[s].bank = bk;
+			}
+
+#ifdef FLIPTABLE
+			print_start_attack(&h_patt);
+#endif
+			// fill all the aggressor rows
+			for (int idx = 0; idx < cfg->aggr_n; idx++) {
+				fill_row(suite, &h_patt.d_lst[idx], cfg->d_cfg, 0);
+			}
+
+			// Reinitialize victim/dummy rows so each round starts from a known state.
+			for (int idx = 0; idx < h_patt.len - 1; idx++) {
+				size_t row_lo = h_patt.d_lst[idx].row;
+				size_t row_hi = h_patt.d_lst[idx + 1].row;
+				for (size_t dummy_row = row_lo + 1; dummy_row < row_hi; dummy_row++) {
+					if (dummy_row >= suite->mapper->base_row + cfg->h_rows) break;
+					DRAMAddr d_dummy = h_patt.d_lst[idx];
+					d_dummy.row = dummy_row;
+					fill_row(suite, &d_dummy, cfg->d_cfg, 1);
+				}
+			}
+
+			uint64_t time = hammer_it(&h_patt, mem);
+			fprintf(stderr, "%ld ", time);
+
+			h_patt.rounds = cfg->h_rounds;
+			bool flipped = scan_rows(suite, &h_patt, 0);
+
+			// refill aggressors and dummies
+			for (int idx = 0; idx < h_patt.len; idx++)
+				fill_row(suite, &h_patt.d_lst[idx], cfg->d_cfg, 1);
+			for (int idx = 0; idx < h_patt.len - 1; idx++) {
+				size_t row_lo = h_patt.d_lst[idx].row;
+				size_t row_hi = h_patt.d_lst[idx + 1].row;
+				for (size_t dummy_row = row_lo + 1; dummy_row < row_hi; dummy_row++) {
+					if (dummy_row >= suite->mapper->base_row + cfg->h_rows) break;
+					DRAMAddr d_dummy = h_patt.d_lst[idx];
+					d_dummy.row = dummy_row;
+					fill_row(suite, &d_dummy, cfg->d_cfg, 1);
+				}
+			}
+
+			if (flipped) {
+
+			size_t low = 1;
+			size_t high = cfg->h_rounds;
+
+			while ((high - low) > BIN_THRESH) {
+
+				size_t mid = (low + high) / 2;
+				h_patt.rounds = mid;
+
+				bool success = try_flip_n(suite, &h_patt, mem);
+
+				fprintf(stderr,
+					"[BIN] aggr=%s bk%zu low=%zu mid=%zu high=%zu result=%d\n",
+					hPatt_2_str(&h_patt, ROW_FIELD),
+					bk, low, mid, high, success);
+
+				if (success)
+					high = mid;
+				else
+					low = mid + 1;
+			}
+
+			fprintf(out_fd,
+				"[THRESH] min_rounds~%zu (+/-%d) aggr=%s bk%zu\n",
+				high,
+				BIN_THRESH,
+				hPatt_2_str(&h_patt, ROW_FIELD),
+				bk);
+#ifdef DEBUG
+			if (g_last_flip_valid) {
+				physaddr_t flip_phys = dram_2_phys(g_last_flip_d_addr, mem);
+				fprintf(out_fd, "[THRESH] flip_phys=0x%lx (%s)\n",
+					flip_phys, dAddr_2_str(g_last_flip_d_addr, ALL_FIELDS));
+				g_last_flip_valid = false;
+			}
+#endif
+
+			h_patt.rounds = cfg->h_rounds;
+		}
+
+#ifdef FLIPTABLE
+			print_end_attack();
+#endif
+		}
+		fprintf(stderr, "\n");
+	}
+
+	free(h_patt.d_lst);
+}
+
+// Scans across every reserved 1GB hugepage in mem (mem->size / GB(1) of them),
+// treating each as its own independent DRAM-addressing domain (own d_base,
+// own ADDRMapper) since separate hugepages are not physically contiguous.
+// Within each hugepage, samples as many rows as fit (rows_per_hugepage),
+// rather than the fixed 256MB slice n_sided_test's dormant branch used.
+int hugepage_sweep_test(HammerSuite * suite)
+{
+	MemoryBuffer *mem = suite->mem;
+	SessionConfig *cfg = suite->cfg;
+
+	uint64_t banks = get_banks_cnt();
+	uint64_t rows_per_hugepage = GB(1) / (ROW_SIZE * banks);
+	cfg->h_rows = rows_per_hugepage;
+
+	size_t n_hugepages = mem->size / GB(1);
+	fprintf(stderr, "[SWEEP] %zu hugepage(s), %lu rows/hugepage, %lu banks\n",
+		n_hugepages, rows_per_hugepage, banks);
+
+	for (size_t hp = 0; hp < n_hugepages; hp++) {
+#ifdef DEBUG
+		if (DEBUG_HUGEPAGE != 0 && (hp + 1) != DEBUG_HUGEPAGE)
+			continue;
+#endif
+		char *chunk_base = mem->buffer + hp * GB(1);
+		physaddr_t chunk_phys = virt_2_phys(chunk_base, mem);
+		set_dram_base_phys(chunk_phys);
+		DRAMAddr d_base = phys_2_dram(chunk_phys);
+		d_base.row += cfg->base_off;
+		d_base.col = 0;
+
+		fprintf(stderr, "[SWEEP] hugepage %zu/%zu base=%s\n",
+			hp + 1, n_hugepages, dAddr_2_str(d_base, ALL_FIELDS));
+
+		init_addr_mapper(suite->mapper, mem, &d_base, cfg->h_rows);
+		suite->d_base = d_base;
+
+		sweep_current_mapper(suite);
+
+		tear_down_addr_mapper(suite->mapper);
+	}
+	return 0;
+}
+
 int free_triple_sided_test(HammerSuite * suite)
 {
 	return 0;
@@ -998,6 +1217,14 @@ int n_sided_test(HammerSuite * suite)
 				BIN_THRESH,
 				hPatt_2_str(&h_patt, ROW_FIELD)
 				);
+#ifdef DEBUG
+			if (g_last_flip_valid) {
+				physaddr_t flip_phys = dram_2_phys(g_last_flip_d_addr, mem);
+				fprintf(out_fd, "[THRESH] flip_phys=0x%lx (%s)\n",
+					flip_phys, dAddr_2_str(g_last_flip_d_addr, ALL_FIELDS));
+				g_last_flip_valid = false;
+			}
+#endif
 
 			h_patt.rounds = cfg->h_rounds;
 		}
@@ -1006,108 +1233,6 @@ int n_sided_test(HammerSuite * suite)
 		print_end_attack();
 	#endif
 		fprintf(stderr, "\n");
-	}
-	else {
-		const int mem_to_hammer = 256 << 20;
-		const int n_rows =  mem_to_hammer / ((8<<10) *  get_banks_cnt());
-		fprintf(stderr, "Hammering %d rows per bank\n", n_rows);
-		for (int r0 = 1; r0 < n_rows; r0++) {
-			h_patt.d_lst[0].row = d_base.row + r0;
-			int k = 1;
-			for (; k < cfg->aggr_n; k++) {
-				int stride = (k == cfg->aggr_n - 1) ? 2 : 2;
-				h_patt.d_lst[k].row = h_patt.d_lst[k - 1].row + stride;
-				h_patt.d_lst[k].bank = 0;
-			}
-			if (h_patt.d_lst[k - 1].row >= d_base.row + cfg->h_rows)
-				break;
- 
-		fprintf(stderr, "[HAMMER] - %s: ", hPatt_2_str(&h_patt, ROW_FIELD));
-		for (size_t bk = 0; bk < get_banks_cnt(); bk++) {
- 
-			for (int s = 0; s < cfg->aggr_n; s++) {
-				h_patt.d_lst[s].bank = bk;
-			}
- 
-#ifdef FLIPTABLE
-				print_start_attack(&h_patt);
-#endif
-			// fill all the aggressor rows
-			for (int idx = 0; idx < cfg->aggr_n; idx++) {
-				fill_row(suite, &h_patt.d_lst[idx], cfg->d_cfg, 0);
-			}
-
-			// Reinitialize victim/dummy rows so each round starts from a known state.
-			for (int idx = 0; idx < h_patt.len - 1; idx++) {
-				size_t row_lo = h_patt.d_lst[idx].row;
-				size_t row_hi = h_patt.d_lst[idx + 1].row;
-				for (size_t dummy_row = row_lo + 1; dummy_row < row_hi; dummy_row++) {
-					if (dummy_row >= suite->mapper->base_row + cfg->h_rows) break;
-					DRAMAddr d_dummy = h_patt.d_lst[idx];
-					d_dummy.row = dummy_row;
-					fill_row(suite, &d_dummy, cfg->d_cfg, 1);
-				}
-			}
- 
-			uint64_t time = hammer_it(&h_patt, mem);
-			fprintf(stderr, "%ld ", time);
- 
-			h_patt.rounds = cfg->h_rounds;
-			bool flipped = scan_rows(suite, &h_patt, 0);
- 
-			// refill aggressors and dummies
-			for (int idx = 0; idx < h_patt.len; idx++)
-				fill_row(suite, &h_patt.d_lst[idx], cfg->d_cfg, 1);
-			for (int idx = 0; idx < h_patt.len - 1; idx++) {
-				size_t row_lo = h_patt.d_lst[idx].row;
-				size_t row_hi = h_patt.d_lst[idx + 1].row;
-				for (size_t dummy_row = row_lo + 1; dummy_row < row_hi; dummy_row++) {
-					if (dummy_row >= suite->mapper->base_row + cfg->h_rows) break;
-					DRAMAddr d_dummy = h_patt.d_lst[idx];
-					d_dummy.row = dummy_row;
-					fill_row(suite, &d_dummy, cfg->d_cfg, 1);
-				}
-			}
- 
-			if (flipped) {
-
-			size_t low = 1;
-			size_t high = cfg->h_rounds;
-
-			while ((high - low) > BIN_THRESH) {
-
-				size_t mid = (low + high) / 2;
-				h_patt.rounds = mid;
-
-				bool success = try_flip_n(suite, &h_patt, mem);
-
-				fprintf(stderr,
-					"[BIN] aggr=%s bk%zu low=%zu mid=%zu high=%zu result=%d\n",
-					hPatt_2_str(&h_patt, ROW_FIELD),
-					bk, low, mid, high, success);
-
-				if (success)
-					high = mid;
-				else
-					low = mid + 1;
-			}
-
-			fprintf(out_fd,
-				"[THRESH] min_rounds~%zu (+/-%d) aggr=%s bk%zu\n",
-				high,
-				BIN_THRESH,
-				hPatt_2_str(&h_patt, ROW_FIELD),
-				bk);
-
-			h_patt.rounds = cfg->h_rounds;
-		}
- 
-#ifdef FLIPTABLE
-				print_end_attack();
-#endif
-		}
-		fprintf(stderr, "\n");
-		}
 	}
 	free(h_patt.d_lst);
 	return 0;
@@ -1226,6 +1351,11 @@ int staggered_hammer_wrapper(HammerSuite *suite)
 		//{.bank = 14, .row = 61775},
 		{.bank = 14, .row = 61777},
 		{.bank = 14, .row = 61779},
+		{.bank = 14, .row = 61781},
+		{.bank = 14, .row = 61783},
+		{.bank = 14, .row = 61785},
+		{.bank = 14, .row = 61787},
+		{.bank = 14, .row = 61789},
 		{.bank = 14, .row = 61791},
 		{.bank = 14, .row = 61793},
 		{.bank = 14, .row = 61795},
@@ -1237,12 +1367,7 @@ int staggered_hammer_wrapper(HammerSuite *suite)
 		{.bank = 14, .row = 61807},
 		{.bank = 14, .row = 61809},
 		{.bank = 14, .row = 61811},
-		{.bank = 14, .row = 61813},
-		{.bank = 14, .row = 61815},
-		{.bank = 14, .row = 61817},
-		{.bank = 14, .row = 61819},
-		{.bank = 14, .row = 61821},
-	    {.bank = 14, .row = 61823}, // comment out to try 18-sided hammering
+	    {.bank = 14, .row = 61813}, // comment out to try 18-sided hammering
 		// {.bank = 14, .row = 61815}, // comment out to try 19-sided hammering
 		// {.bank = 14, .row = 61817}, // comment out to try 20-sided hammering
 		// {.bank = 14, .row = 61819}, // comment out to try 21-sided hammering
@@ -1351,7 +1476,9 @@ void fuzzing_session(SessionConfig * cfg, MemoryBuffer * mem)
 	int d, v, aggrs;
 
 	srand(CL_SEED);
-	DRAMAddr d_base = phys_2_dram(virt_2_phys(mem->buffer, mem));
+	physaddr_t base_phys = virt_2_phys(mem->buffer, mem);
+	set_dram_base_phys(base_phys);
+	DRAMAddr d_base = phys_2_dram(base_phys);
 	fprintf(stdout, "[INFO] d_base.row:%lu\n", d_base.row);
 
 	/* Init FILES */
@@ -1406,11 +1533,13 @@ void fuzzing_session(SessionConfig * cfg, MemoryBuffer * mem)
 void hammer_session(SessionConfig * cfg, MemoryBuffer * memory)
 {
 	MemoryBuffer mem = *memory;
- 
-	DRAMAddr d_base = phys_2_dram(virt_2_phys(mem.buffer, &mem));
+
+	physaddr_t base_phys = virt_2_phys(mem.buffer, &mem);
+	set_dram_base_phys(base_phys);
+	DRAMAddr d_base = phys_2_dram(base_phys);
 	d_base.row += cfg->base_off;
 	fprintf(stderr, "base_phys: %lx, base_v: %p, base_d: %s\n",
-		virt_2_phys(mem.buffer, &mem), mem.buffer, dAddr_2_str(d_base, ALL_FIELDS));
+		base_phys, mem.buffer, dAddr_2_str(d_base, ALL_FIELDS));
  
 	create_dir(DATA_DIR);
 	char *out_name = (char *)malloc(1024);
@@ -1463,9 +1592,12 @@ void hammer_session(SessionConfig * cfg, MemoryBuffer * memory)
 	suite->mem = &mem;
 	suite->d_base = d_base;
 	suite->mapper = (ADDRMapper *) malloc(sizeof(ADDRMapper));
- 
-	init_addr_mapper(suite->mapper, &mem, &suite->d_base, cfg->h_rows);
- 
+
+	// SWEEP_ALL builds/tears down its own mapper per hugepage (hugepage_sweep_test),
+	// since each hugepage needs its own d_base/h_rows rather than this single one.
+	if (cfg->h_cfg != SWEEP_ALL)
+		init_addr_mapper(suite->mapper, &mem, &suite->d_base, cfg->h_rows);
+
 	fprintf(stderr, "done mapping\n");
 #ifndef FLIPTABLE
 	export_cfg(suite);	// export the configuration of the experiment to file.
@@ -1494,6 +1626,9 @@ void hammer_session(SessionConfig * cfg, MemoryBuffer * memory)
 		case DELAYED:
 			suite->hammer_test = (int (*)(void *))staggered_hammer_wrapper;
 			break;
+		case SWEEP_ALL:
+			suite->hammer_test = (int (*)(void *))hugepage_sweep_test;
+			break;
 		default:
 		{
 			suite->hammer_test = (int (*)(void *))n_sided_test;
@@ -1503,6 +1638,7 @@ void hammer_session(SessionConfig * cfg, MemoryBuffer * memory)
 
 	suite->hammer_test(suite);
 	fclose(out_fd);
-	tear_down_addr_mapper(suite->mapper);
+	if (cfg->h_cfg != SWEEP_ALL)
+		tear_down_addr_mapper(suite->mapper);
 	free(suite);
 }

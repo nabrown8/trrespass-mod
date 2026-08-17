@@ -53,6 +53,9 @@ void print_usage(char *bin_name)
 	fprintf(stderr, "\t-T --target-pattern\t= hex value for the target pattern\n");
 	fprintf(stderr, "\t-f --fuzzing\t\t= Start fuzzing (--aggr will be ignored)\n");
 	fprintf(stderr, "\t-t --threshold\t\t= Align the hammering to refresh ops,\n\t\t\t\t looking at the memory latency in CPU cycles.\t(default: 0)\n");
+	fprintf(stderr, "\t-H --hugepages N\t= number of 1GB hugepages to allocate\t\t(default: 1)\n\t\t\t\t (must already be reserved, e.g. via\n\t\t\t\t /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages)\n");
+	fprintf(stderr, "\t-s --sweep\t\t= scan across all --hugepages, sampling as much\n\t\t\t\t of each one as possible, instead of the static target list\n");
+	fprintf(stderr, "\t--verify-hash\t\t= empirically test the bank hash functions via timing,\n\t\t\t\t then exit (uses -r for rounds/pair, -t for the cycle threshold)\n");
 }
 
 static int str2pat(const char *str, char **pat)
@@ -118,6 +121,9 @@ int process_argv(int argc, char *argv[], ProfileParams *p)
 		{.name = "aggr",.has_arg = required_argument,.flag = NULL,.val='a'},
 		{.name = "fuzzing", .has_arg = no_argument, .flag = NULL, .val = 'f'},
 		{.name = "threshold",.has_arg = required_argument,.flag = NULL,.val = 't'},
+		{.name = "hugepages",.has_arg = required_argument,.flag = NULL,.val = 'H'},
+		{.name = "sweep",.has_arg = no_argument,.flag = NULL,.val = 's'},
+		{.name = "verify-hash",.has_arg = no_argument,.flag = NULL,.val = 'K'},
 		{0, 0, 0, 0}
 	};
 
@@ -127,7 +133,7 @@ int process_argv(int argc, char *argv[], ProfileParams *p)
 	while (1) {
 		int this_option_optind = optind ? optind : 1;
 		int option_index = 0;
-		int arg = getopt_long(argc, argv, "o:d:r:hvV:T:a:ft:",
+		int arg = getopt_long(argc, argv, "o:d:r:hvV:T:a:ft:H:s",
 				      long_options, &option_index);
 
 		if (arg == -1)
@@ -137,7 +143,7 @@ int process_argv(int argc, char *argv[], ProfileParams *p)
 		case 0:
 			switch (option_index) {
 			case 0:
-				p->m_size = atoi(optarg);
+				p->m_size = strtoull(optarg, NULL, 10);
 				break;
 			case 1:
 				p->m_align = atoi(optarg);
@@ -196,6 +202,16 @@ int process_argv(int argc, char *argv[], ProfileParams *p)
 			break;
 		case 't':
 			p->threshold = atoi(optarg);
+			break;
+		case 'H':
+			p->n_hugepages = strtoull(optarg, NULL, 10);
+			p->m_size = p->n_hugepages * GB(1);
+			break;
+		case 's':
+			p->sweep_all = 1;
+			break;
+		case 'K':
+			p->verify_hash = 1;
 			break;
 		case 'h':
 		default:

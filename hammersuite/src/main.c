@@ -26,13 +26,15 @@
 ProfileParams *p;
 
 // DRAMLayout     g_mem_layout = {{{0x4080,0x88000,0x110000,0x220000,0x440000,0x4b300}, 6}, 0xffff80000, ((1<<13)-1)};
-DRAMLayout 			g_mem_layout = { {{0x2040, 0x44000, 0x88000, 0x110000, 0x220000}, 5}, 0xffffc0000, ((1 << 13) - 1) };
+//DRAMLayout 			g_mem_layout = { {{0x2040, 0x44000, 0x88000, 0x110000, 0x220000}, 5}, 0xffffc0000, ((1 << 13) - 1) };
 // DRAMLayout 			g_mem_layout = {{{0x2040,0x24000,0x48000,0x90000},4}, 0xffffe0000, ((1<<13)-1)};
 // DRAMLayout      g_mem_layout = {{{0x4080,0x48000,0x90000,0x120000,0x1b300}, 5}, 0xffffc0000, ROW_SIZE-1};
 //DRAMLayout      g_mem_layout = {{{0x4080,0x48000,0x90000,0x120000,0x1b300}, 5}, 0x7ffc0000, ((1 << 13) - 1)};
-//DRAMLayout g_mem_layout = {{{0x2040, 0x24000, 0x48000, 0x90000}, 4}, 0xffffe0000, ROW_SIZE-1};
+//DRAMLayout g_mem_layout = {{{0x2040, 0x14000, 0x28000}, 3}, 0xffffe0000, ROW_SIZE-1};
 //DRAMLayout g_mem_layout = {{{0x2040, 0x24000, 0x48000, 0x90000}, 4}, 0x1ffffe0000, ROW_SIZE-1};
 //DRAMLayout 			g_mem_layout = { {{0x2040, 0x44000, 0x88000, 0x110000, 0x220000}, 5}, 0xffffc0000, ((1 << 13) - 1) };
+//DRAMLayout 			g_mem_layout = { {{0x4080, 0x108000, 0x210000, 0x420000, 0x840000, 0x1080000, 0xc3300}, 7}, 0x7ff00000, ((1 << 13) - 1) }; //128-bks, 4 DIMMs
+DRAMLayout 			g_mem_layout = { {{0x4080, 0x108000, 0x210000, 0x420000, 0x840000, 0x1080000, 0xc3300}, 7}, 0xffff00000, (0x1fff) }; //128-bks, 4 DIMMs
 
 void read_config(SessionConfig * cfg, char *f_name)
 {
@@ -94,6 +96,13 @@ int main(int argc, char **argv)
 	set_physmap(&mem);
 	gmem_dump();
 
+	if (p->verify_hash) {
+		bool ok = verify_hash_fns(&mem, 1000, 200, p->rounds,
+					   (uint64_t) p->threshold);
+		close(p->huge_fd);
+		return ok ? 0 : 1;
+	}
+
 	SessionConfig s_cfg;
 	memset(&s_cfg, 0, sizeof(SessionConfig));
 	if (p->g_flags & F_CONFIG) {
@@ -102,7 +111,7 @@ int main(int argc, char **argv)
 		// HARDCODED values
 		s_cfg.h_rows = PATT_LEN;
 		s_cfg.h_rounds = p->rounds;
-		s_cfg.h_cfg = DELAYED;
+		s_cfg.h_cfg = p->sweep_all ? SWEEP_ALL : N_SIDED;
 		s_cfg.d_cfg = RANDOM;
 		s_cfg.base_off = p->base_off;
 		s_cfg.aggr_n = p->aggr;

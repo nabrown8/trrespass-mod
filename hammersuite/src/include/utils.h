@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <time.h>
 
+#include "types.h"
+
 #define BIT_SET(x) 		(1ULL<<(x))
 #define BIT_VAL(b,val) 	(((val) >> (b)) & 1)
 #define KB(x) 			((x)<<10ULL)
@@ -126,3 +128,14 @@ char *int_2_bin(uint64_t val);
 char *get_rnd_addr(char *base, size_t m_size, size_t align);
 
 int get_rnd_int(int min, int max);
+
+// Empirically checks whether the DRAM bank hash functions in g_mem_layout
+// actually predict real access-timing behavior: draws n_addrs random
+// addresses from mem, buckets them by computed bank, times n_pairs same-bank
+// pairs and n_pairs diff-bank pairs (each averaged over `rounds` toggled
+// access+clflush rounds), and compares the fraction of each group whose avg
+// latency exceeds thresh_cycles. Returns true iff same-bank pairs are mostly
+// above threshold and diff-bank pairs are mostly below it (prints the
+// percentages and per-pair timings to stderr either way).
+bool verify_hash_fns(MemoryBuffer * mem, size_t n_addrs, size_t n_pairs,
+		      size_t rounds, uint64_t thresh_cycles);

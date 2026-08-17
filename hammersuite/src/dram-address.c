@@ -10,6 +10,18 @@
 
 extern DRAMLayout g_mem_layout;
 
+// Physical base (of the current 1GB-aligned chunk being addressed) that
+// dram_2_phys() ORs into the upper bits of the addresses it builds. Must be
+// set via set_dram_base_phys() before dram_2_phys() is called for a given
+// hugepage/chunk - separate chunks are not physically contiguous, so this
+// has to be updated per-chunk rather than derived once from the whole buffer.
+static physaddr_t g_dram_base_phys = 0;
+
+void set_dram_base_phys(physaddr_t base)
+{
+	g_dram_base_phys = base;
+}
+
 uint64_t get_dram_row(physaddr_t p_addr)
 {
 	return (p_addr & g_mem_layout.
@@ -60,9 +72,7 @@ physaddr_t dram_2_phys(DRAMAddr d_addr, MemoryBuffer *mem)
 		p_addr ^= 1ULL << h_lsb;
 	}
 	
-	uint64_t physical_base = virt_2_phys(mem->buffer, mem);
-
-	p_addr |= physical_base & ~(((uint64_t) PAGE_SIZE - 1));
+	p_addr |= g_dram_base_phys & ~(((uint64_t) PAGE_SIZE - 1));
 
 
 #if DEBUG_REVERSE_FN

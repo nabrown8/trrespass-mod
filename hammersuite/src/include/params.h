@@ -35,6 +35,9 @@ typedef struct ProfileParams {
 	int		 huge_fd;
 	char     *conf_file		= (char *)CONFIG_NAME_std;
 	int 	 aggr			= AGGR_std;
+	size_t   n_hugepages	= 1;		// default matches single-hugepage ALLOC_SIZE
+	int		 sweep_all		= 0;		// --sweep: scan across n_hugepages hugepages
+	int		 verify_hash	= 0;		// --verify-hash: run verify_hash_fns() and exit
 } ProfileParams;
 
 int process_argv(int argc, char *argv[], ProfileParams *params);

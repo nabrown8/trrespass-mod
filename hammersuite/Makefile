@@ -5,7 +5,7 @@ BUILD=obj
 ODIR=src/.obj
 DATA_DIR=$(PWD)/data/
 
-CFLAGS=-I$(IDIR) -msse4.2 -ggdb -DDATA_DIR=\"$(DATA_DIR)\" -fsanitize=address,undefined -fstack-protector-all -pthread -g -O0
+CFLAGS=-I$(IDIR) -msse4.2 -ggdb -DDATA_DIR=\"$(DATA_DIR)\" -fsanitize=address,undefined -fstack-protector-all -pthread -g -O3 -MMD -MP
 # CXX=g++
 LDFLAGS=
 
@@ -33,6 +33,8 @@ $(OUT): $(OBJECTS)
 	mkdir -p $(BUILD)
 	$(CXX) -o $(BUILD)/$@ $^ $(CFLAGS) $(LDFLAGS) $(LDEPS)
 	chmod +x $(BUILD)/$@
+
+-include $(OBJECTS:.o=.d)
 
 clean:
 	rm -rf $(BUILD)

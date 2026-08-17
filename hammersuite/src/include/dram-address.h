@@ -2,7 +2,7 @@
 
 #include "types.h"
 
-#define HASH_FN_CNT 6
+#define HASH_FN_CNT 7
 
 typedef struct {
 	uint64_t lst[HASH_FN_CNT];
@@ -24,6 +24,7 @@ typedef struct {
 } DRAMAddr;
 
 physaddr_t dram_2_phys(DRAMAddr d_addr, MemoryBuffer *mem);
+void set_dram_base_phys(physaddr_t base);
 DRAMAddr phys_2_dram(physaddr_t p_addr);
 char *dram_2_str(DRAMAddr * d_addr);
 char *dramLayout_2_str(DRAMLayout * mem_layout);
