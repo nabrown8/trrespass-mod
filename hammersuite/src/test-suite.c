@@ -363,6 +363,7 @@ static void *aggressor_thread(void *arg)
 
 static void *dummy_thread(void *arg)
 {
+	sleep(1);
     HammerThreadArgs *a = (HammerThreadArgs *)arg;
     while (1) {
         pthread_barrier_wait(&a->barrier_ready);
@@ -1878,7 +1879,7 @@ int staggered_hammer_wrapper(HammerSuite *suite)
 	// inner_delay: cycles the aggressor thread waits between a0/a1/...
 	// activations. outer_delay: only used by HAMMER_FULL_SEND -- cycles
 	// the dummy thread waits between each full pass over its rows.
-	uint64_t inner_delay = 10000;
+	uint64_t inner_delay = 15000;
 	uint64_t outer_delay = 0;
 
 	if (target_cnt > 0)
