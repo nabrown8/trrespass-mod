@@ -13,6 +13,15 @@ typedef struct {
 	AddrFns h_fns;
 	uint64_t row_mask;
 	uint64_t col_mask;
+	// PCI-hole-style offset hoisting: any physical address >= base_value
+	// has been hoisted above a reserved region, so offset must be
+	// subtracted from it before it is linear/contiguous again and safe to
+	// feed into h_fns/row_mask/col_mask. Addresses below base_value are
+	// already linear and pass through unchanged. {0, 0} (the default when
+	// omitted from an initializer) is a no-op, since every physaddr_t is
+	// >= 0 and subtracting 0 is the identity.
+	physaddr_t base_value;
+	physaddr_t offset;
 } DRAMLayout;
 
 typedef struct {

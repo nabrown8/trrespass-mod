@@ -40,10 +40,14 @@ RowMap gen_row_map(DRAMAddr d_src, MemoryBuffer * mem)
 
 	for (size_t col = 0; col < g_rmap_len; col++, d_src.col += (1 << 6)) {
 		dst[col].d_addr = d_src;
-		dst[col].v_addr = phys_2_virt(dram_2_phys(d_src, mem), mem);
-		// fprintf(stderr, "try v_addr\n");
-		// fprintf(stderr, "bk%ld/r%ld/col%ld \t%p \t%lx\n", d_src.bank, d_src.row, d_src.col, dst[col].v_addr, dram_2_phys(d_src, mem));
-
+		physaddr_t p_addr = dram_2_phys(d_src, mem);
+		dst[col].v_addr = phys_2_virt(p_addr, mem);
+		if (dst[col].v_addr == (char *)NOT_FOUND) {
+			fprintf(stderr,
+				"[ERROR] - gen_row_map: bk%ld/r%ld/col%ld -> phys 0x%lx "
+				"has no backing page in mem->physmap\n",
+				d_src.bank, d_src.row, d_src.col, p_addr);
+		}
 	}
 	rmap.lst = dst;
 	rmap.len = g_rmap_len;

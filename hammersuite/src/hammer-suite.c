@@ -50,7 +50,7 @@
  */
 
 #define SHADOW_FLAGS (MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE)
-#define DEBUG
+// #define DEBUG
 
 #ifdef DEBUG
 // when set, hugepage_sweep_test/sweep_current_mapper only hammers this
@@ -59,12 +59,14 @@
 // current hugepage resolves to (suite->d_base.row, recomputed per-hugepage
 // from phys_2_dram), so e.g. 11 always means "base_row+11" even if the
 // row-mapping functions change what base row gets reported.
-#define DEBUG_BANK 16
-static const size_t DEBUG_ROW_OFFSETS[] = { 11, 12 };
+// Which bank hugepage_sweep_test/sweep_current_mapper restricts hammering
+// to. -1 disables the filter (every bank, same as the non-DEBUG sweep).
+#define DEBUG_BANK -1
+static const size_t DEBUG_ROW_OFFSETS[] = { 11 };
 #define DEBUG_ROW_OFFSETS_CNT (sizeof(DEBUG_ROW_OFFSETS) / sizeof(DEBUG_ROW_OFFSETS[0]))
 // which hugepage (1-indexed, matching the "[SWEEP] hugepage N/M" log lines)
 // hugepage_sweep_test should hammer; 0 disables the filter (all hugepages).
-#define DEBUG_HUGEPAGE 7
+#define DEBUG_HUGEPAGE 2
 #endif
 
 #define ROUND_STEP 2000
@@ -419,7 +421,7 @@ uint64_t hammer_with_delay(HammerPattern *patt, MemoryBuffer *mem, size_t aggr_c
     g_hammer_args.len       = patt->len;
     g_hammer_args.rounds    = patt->rounds;
     g_hammer_args.aggr_cnt  = aggr_cnt;
-    g_hammer_args.act_delay = 10000;
+    g_hammer_args.act_delay = 7500;
     pthread_barrier_wait(&g_hammer_args.barrier_ready);
     uint64_t t0 = realtime_now();
     pthread_barrier_wait(&g_hammer_args.barrier_start);
@@ -480,9 +482,9 @@ uint64_t hammer_it(HammerPattern* patt, MemoryBuffer* mem) {
 			//temp--;
 			asm volatile("sfence" ::: "memory");
 
-		// uint64_t next = cl0 + (uint64_t)(i + 1) * round_in_ns;
-    	// while (realtime_now() < next)
-       	// 	asm volatile("pause");
+		uint64_t next = cl0 + (uint64_t)(i + 1) * round_in_ns;
+    	while (realtime_now() < next)
+       		asm volatile("pause");
 		}
 	}
 	cl1 = realtime_now();
@@ -945,7 +947,7 @@ static void sweep_current_mapper(HammerSuite *suite)
 		fprintf(stderr, "[HAMMER] - %s: ", hPatt_2_str(&h_patt, ROW_FIELD));
 		for (size_t bk = 0; bk < get_banks_cnt(); bk++) {
 #ifdef DEBUG
-			if (bk != DEBUG_BANK)
+			if (DEBUG_BANK >= 0 && bk != (size_t)DEBUG_BANK)
 				continue;
 #endif
 
@@ -1049,13 +1051,29 @@ static void sweep_current_mapper(HammerSuite *suite)
 // own ADDRMapper) since separate hugepages are not physically contiguous.
 // Within each hugepage, samples as many rows as fit (rows_per_hugepage),
 // rather than the fixed 256MB slice n_sided_test's dormant branch used.
+//
+// This is the general per-hugepage driver for every hammer_test, not just
+// SWEEP_ALL's sweep_current_mapper: g_dram_base_phys/suite->d_base/
+// suite->mapper only ever cover one hugepage's worth of rows (see
+// dram_2_phys()'s base-combining logic, which silently corrupts row bits
+// once a row crosses a 1GB hugepage boundary), so every hammer_test needs
+// re-basing per hugepage to safely cover more than rows_per_hugepage rows.
 int hugepage_sweep_test(HammerSuite * suite)
 {
 	MemoryBuffer *mem = suite->mem;
 	SessionConfig *cfg = suite->cfg;
 
 	uint64_t banks = get_banks_cnt();
-	uint64_t rows_per_hugepage = GB(1) / (ROW_SIZE * banks);
+	// NOT GB(1)/(ROW_SIZE*banks): that assumes consecutive row values are
+	// exactly ROW_SIZE*banks apart in physical address space, which only
+	// holds if row_mask's lowest set bit lines up with that stride. The
+	// real row-to-address stride is whatever row_mask's ctz says it is
+	// (there can be extra interleaving bits between col_mask and row_mask
+	// beyond what bank count alone accounts for), so derive it from
+	// row_mask directly or this silently computes too many "rows" per
+	// hugepage and walks off the end of the real 1GB allocation.
+	uint64_t rows_per_hugepage =
+	    GB(1) >> __builtin_ctzl(get_dram_layout()->row_mask);
 	cfg->h_rows = rows_per_hugepage;
 
 	size_t n_hugepages = mem->size / GB(1);
@@ -1063,26 +1081,69 @@ int hugepage_sweep_test(HammerSuite * suite)
 		n_hugepages, rows_per_hugepage, banks);
 
 	for (size_t hp = 0; hp < n_hugepages; hp++) {
+		// --start-hugepage is 1-indexed (matches the "[SWEEP] hugepage N/M"
+		// log lines below), so previously scanned hugepages can be skipped.
+		if (hp + 1 < p->start_hugepage)
+			continue;
 #ifdef DEBUG
 		if (DEBUG_HUGEPAGE != 0 && (hp + 1) != DEBUG_HUGEPAGE)
 			continue;
 #endif
 		char *chunk_base = mem->buffer + hp * GB(1);
 		physaddr_t chunk_phys = virt_2_phys(chunk_base, mem);
-		set_dram_base_phys(chunk_phys);
-		DRAMAddr d_base = phys_2_dram(chunk_phys);
-		d_base.row += cfg->base_off;
-		d_base.col = 0;
 
-		fprintf(stderr, "[SWEEP] hugepage %zu/%zu base=%s\n",
-			hp + 1, n_hugepages, dAddr_2_str(d_base, ALL_FIELDS));
+		// phys_2_dram(chunk_phys).row is NOT guaranteed to already be a
+		// clean multiple of rows_per_hugepage: chunk_phys is 1GB-aligned,
+		// but g_mem_layout's PCI-hole hoist offset isn't a multiple of
+		// 1GB (0x20000000 vs 0x40000000 here), so linearizing a hoisted
+		// (>= base_value) chunk_phys lands some of its low (fractional)
+		// bits inside row_mask -- those bits are real and required (they
+		// select *this* physical hugepage), so clearing them would quietly
+		// retarget a different, unallocated 1GB region. We shrink how many
+		// rows we sweep for this *part* so d_base.row+row never carries
+		// into the bits that select a different hugepage -- but that
+		// trimmed-off leftover is still real, hammerable rows inside this
+		// same hugepage, just reachable from a different real physical
+		// base. get_linear_phys()/get_hoisted_phys() are both just a
+		// conditional +/- g_mem_layout.offset, so advancing the real phys
+		// address by exactly that offset lands precisely on the
+		// linear-space boundary this part's trimming stopped short of.
+		// Loop over parts until every row in this hugepage has been
+		// covered by some part (ordinarily 1 part; 2 when the hoist
+		// splits it).
+		physaddr_t sub_phys = chunk_phys;
+		uint64_t rows_done = 0;
+		int part = 0;
+		while (rows_done < rows_per_hugepage) {
+			set_dram_base_phys(sub_phys);
+			DRAMAddr d_base = phys_2_dram(sub_phys);
+			d_base.row += cfg->base_off;
+			d_base.col = 0;
 
-		init_addr_mapper(suite->mapper, mem, &d_base, cfg->h_rows);
-		suite->d_base = d_base;
+			uint64_t used = d_base.row & (rows_per_hugepage - 1);
+			uint64_t safe_rows = rows_per_hugepage - used;
+			uint64_t remaining = rows_per_hugepage - rows_done;
+			cfg->h_rows = safe_rows < remaining ? safe_rows : remaining;
 
-		sweep_current_mapper(suite);
+			fprintf(stderr,
+				"[SWEEP] hugepage %zu/%zu part %d base=%s (%lu safe rows)\n",
+				hp + 1, n_hugepages, part,
+				dAddr_2_str(d_base, ALL_FIELDS), cfg->h_rows);
 
-		tear_down_addr_mapper(suite->mapper);
+			init_addr_mapper(suite->mapper, mem, &d_base, cfg->h_rows);
+			suite->d_base = d_base;
+
+			suite->hammer_test(suite);
+
+			tear_down_addr_mapper(suite->mapper);
+
+			rows_done += cfg->h_rows;
+			if (rows_done >= rows_per_hugepage)
+				break;
+
+			sub_phys += get_dram_layout()->offset;
+			part++;
+		}
 	}
 	return 0;
 }
@@ -1117,7 +1178,7 @@ int n_sided_test(HammerSuite * suite)
 	fprintf(stderr, "CL_SEED: %lx\n", CL_SEED);
  
 	h_patt.d_lst[0] = d_base;
-	bool static_hammer = true;
+	bool static_hammer = false;
 	if (static_hammer) {
 		DRAMAddr targets[] = {
 			{.bank = 14, .row = 61777},
@@ -1238,6 +1299,10 @@ int n_sided_test(HammerSuite * suite)
 	return 0;
 }
 
+// Fills aggressor/dummy rows for one aggr_n-wide window and runs it through
+// hammer_with_delay (2 real aggressors + the rest stepped as dummies),
+// scanning for flips. Shared by staggered_hammer (explicit row list) and
+// staggered_hammer_scan (generic sweep) so both stay in sync.
 int staggered_hammer(HammerSuite *suite,
                       const DRAMAddr *targets,
                       size_t target_cnt)
@@ -1593,11 +1658,10 @@ void hammer_session(SessionConfig * cfg, MemoryBuffer * memory)
 	suite->d_base = d_base;
 	suite->mapper = (ADDRMapper *) malloc(sizeof(ADDRMapper));
 
-	// SWEEP_ALL builds/tears down its own mapper per hugepage (hugepage_sweep_test),
-	// since each hugepage needs its own d_base/h_rows rather than this single one.
-	if (cfg->h_cfg != SWEEP_ALL)
-		init_addr_mapper(suite->mapper, &mem, &suite->d_base, cfg->h_rows);
-
+	// hugepage_sweep_test builds/tears down suite->mapper fresh per hugepage
+	// and re-bases g_dram_base_phys each time, so every hammer_test runs
+	// through it rather than against a single mapper/base covering the
+	// whole (possibly multi-hugepage, non-contiguous) buffer.
 	fprintf(stderr, "done mapping\n");
 #ifndef FLIPTABLE
 	export_cfg(suite);	// export the configuration of the experiment to file.
@@ -1627,18 +1691,16 @@ void hammer_session(SessionConfig * cfg, MemoryBuffer * memory)
 			suite->hammer_test = (int (*)(void *))staggered_hammer_wrapper;
 			break;
 		case SWEEP_ALL:
-			suite->hammer_test = (int (*)(void *))hugepage_sweep_test;
+			suite->hammer_test = (int (*)(void *))sweep_current_mapper;
 			break;
 		default:
 		{
 			suite->hammer_test = (int (*)(void *))n_sided_test;
 		}
 	}
- 
 
-	suite->hammer_test(suite);
+
+	hugepage_sweep_test(suite);
 	fclose(out_fd);
-	if (cfg->h_cfg != SWEEP_ALL)
-		tear_down_addr_mapper(suite->mapper);
 	free(suite);
 }

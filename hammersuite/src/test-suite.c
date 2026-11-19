@@ -77,7 +77,7 @@ static const size_t DEBUG_ROW_OFFSETS[] = { 11 };
 #define NOP100 NOP10 NOP10 NOP10 NOP10 NOP10 NOP10 NOP10 NOP10 NOP10 NOP10
 #define NOP1000 NOP100 NOP100 NOP100 NOP100 NOP100 NOP100 NOP100 NOP100 NOP100 NOP100
 
-#define BIN_THRESH 500
+#define BIN_THRESH 100
 #define BIN_TRIES 50
 
 extern ProfileParams *p;
@@ -439,6 +439,16 @@ uint64_t hammer_with_delay(HammerPattern *patt, MemoryBuffer *mem,
     return (t1 - t0) / patt->rounds;
 }
 
+// Diagnostic only: when set (by full_send_thread, for the aggressor side
+// only), hammer_it's inner_delay path records the rdtscp latency of each
+// *(volatile char*) v_lst[j] load into this per-thread buffer, to tell a
+// real row-conflict ACTIVATE (slow) apart from a row-buffer hit on an
+// already-open row (fast) -- a question raw round/access counts can't
+// answer. __thread keeps the dummy thread's copy permanently NULL/unused.
+static __thread uint64_t *g_lat_buf   = NULL;
+static __thread size_t    g_lat_cap   = 0;
+static __thread size_t    g_lat_count = 0;
+
 // inner_delay: cycles to wait *between individual aggressor accesses*
 //   within a round (a0, wait, a1, wait, a0, ...). 0 = no per-access wait,
 //   and the whole round is issued as the original access-all/flush-all
@@ -451,9 +461,14 @@ uint64_t hammer_with_delay(HammerPattern *patt, MemoryBuffer *mem,
 //   dummy side of hammer_it_delayed keeps stepping through its rows for
 //   as long as the aggressor side is still hammering, rather than
 //   finishing its own fixed round count early and going idle.
+// signal_done: NULL = no-op. Non-NULL = set to 1 right after the hammering
+//   loop finishes, before the trailing cleanup sleep below -- lets a driver
+//   thread (full_send) tell the other side to stop as soon as the real work
+//   is done, instead of after this function's 100ms settle sleep.
 uint64_t hammer_it(HammerPattern* patt, MemoryBuffer* mem,
                     uint64_t inner_delay, uint64_t outer_delay,
-                    volatile int *stop_flag, uint64_t *rounds_out) {
+                    volatile int *stop_flag, uint64_t *rounds_out,
+                    volatile int *signal_done) {
 
 	char** v_lst = (char**) malloc(sizeof(char*)*patt->len);
 	for (size_t i = 0; i < patt->len; i++) {
@@ -477,6 +492,7 @@ uint64_t hammer_it(HammerPattern* patt, MemoryBuffer* mem,
 	uint64_t round_in_ns = 0;//6600 / 4; // cycles -> ns, 4 GHz
 	uint64_t cl0, cl1;
 	size_t i;
+	const int RDS_PER_ROUND = 1; // # of access+flush sweeps the inner loop does per outer round
 
 	// --phase-sweep: walk the delay inserted between the detected refresh
 	// spike and the start of hammering, one hammer_it() CALL at a time: all
@@ -517,7 +533,7 @@ uint64_t hammer_it(HammerPattern* patt, MemoryBuffer* mem,
 					asm volatile("pause");
 			}
 		}
-		for (int rds = 0; rds < 2; rds++) {
+		for (int rds = 0; rds < RDS_PER_ROUND; rds++) {
 		mfence();
 			if (inner_delay == 0) {
 				for (size_t j = 0; j < patt->len; j++) {
@@ -530,7 +546,11 @@ uint64_t hammer_it(HammerPattern* patt, MemoryBuffer* mem,
 				// one aggressor at a time, waiting inner_delay cycles
 				// between each activation: a0, wait, a1, wait, a0, ...
 				for (size_t j = 0; j < patt->len; j++) {
+					bool __lat_on = g_lat_buf && g_lat_count < g_lat_cap;
+					uint64_t __lat_t0 = __lat_on ? rdtscp() : 0;
 					*(volatile char*) v_lst[j];
+					if (__lat_on)
+						g_lat_buf[g_lat_count++] = rdtscp() - __lat_t0;
 					clflushopt(v_lst[j]);
 
 					uint64_t t0 = rdtscp();
@@ -552,13 +572,19 @@ uint64_t hammer_it(HammerPattern* patt, MemoryBuffer* mem,
 		}
 	}
 	cl1 = realtime_now();
+	if (signal_done)
+		*signal_done = 1;
 	usleep(100000); // sleep for 100 ms to ensure no accumulation
 	free(v_lst);
 	size_t n_rounds = stop_flag ? i : patt->rounds;
 	if (n_rounds == 0) n_rounds = 1;
 	uint64_t ns_per_round = (cl1-cl0) / n_rounds;
-	fprintf(stderr, "[TIMING] hammer_it: %zu rounds, %lu ns total, %lu ns/round\n",
-		n_rounds, cl1-cl0, ns_per_round);
+	double rounds_per_trefi = (7800.0 / (double)ns_per_round) * RDS_PER_ROUND;
+	fprintf(stderr, "[TIMING] hammer_it: %zu rounds, %lu ns total, %lu ns/round, %.2f rounds/tREFI\n",
+		n_rounds, cl1-cl0, ns_per_round, rounds_per_trefi);
+	fprintf(out_fd, "[TIMING] hammer_it: %zu rounds, %lu ns total, %lu ns/round, %.2f rounds/tREFI\n",
+		n_rounds, cl1-cl0, ns_per_round, rounds_per_trefi);
+	fflush(out_fd);
 	if (rounds_out)
 		*rounds_out = n_rounds;
 	return ns_per_round;
@@ -596,11 +622,30 @@ static void *full_send_thread(void *arg)
     CPU_SET(a->core, &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 
-    a->ret = hammer_it(a->patt, a->mem, a->inner_delay, a->outer_delay,
-                        a->is_driver ? NULL : a->stop_flag, &a->rounds_done);
+    // Diagnostic: only the aggressor (is_driver) side records per-access
+    // load latencies -- see g_lat_buf's comment above hammer_it.
+    if (a->is_driver) {
+        g_lat_cap = a->patt->rounds < 200000 ? a->patt->rounds : 200000;
+        g_lat_buf = (uint64_t *)malloc(sizeof(uint64_t) * g_lat_cap);
+        g_lat_count = 0;
+    }
 
-    if (a->is_driver)
-        *a->stop_flag = 1;
+    a->ret = hammer_it(a->patt, a->mem, a->inner_delay, a->outer_delay,
+                        a->is_driver ? NULL : a->stop_flag, &a->rounds_done,
+                        a->is_driver ? a->stop_flag : NULL);
+
+    if (a->is_driver && g_lat_buf) {
+        FILE *f = fopen("/tmp/aggr_latencies.csv", "w");
+        if (f) {
+            for (size_t k = 0; k < g_lat_count; k++)
+                fprintf(f, "%lu\n", g_lat_buf[k]);
+            fclose(f);
+        }
+        fprintf(stderr, "[LATENCY] wrote %zu aggressor access latencies to /tmp/aggr_latencies.csv\n",
+                g_lat_count);
+        free(g_lat_buf);
+        g_lat_buf = NULL;
+    }
 
     return NULL;
 }
@@ -641,6 +686,7 @@ static uint64_t hammer_full_send(HammerSuite *suite, HammerPattern *h_patt,
 
     pthread_t t_aggr, t_dummy;
     pthread_create(&t_aggr,  NULL, full_send_thread, &aggr_args);
+	usleep(1000); // sleep for 1ms before starting dummy
     pthread_create(&t_dummy, NULL, full_send_thread, &dummy_args);
 
     pthread_join(t_aggr, NULL);
@@ -1101,7 +1147,7 @@ static bool try_flip_n(HammerSuite *suite, HammerPattern *h_patt, MemoryBuffer *
         // Refill dummy rows (sorted by row, independent of d_lst's order)
         fill_victim_rows(suite, h_patt);
 
-        uint64_t ttime = hammer_it(h_patt, mem, 0, 0, NULL, NULL);
+        uint64_t ttime = hammer_it(h_patt, mem, 0, 0, NULL, NULL, NULL);
         if (ttime == 0) return false;  // treat OOB as failure
 
         if (scan_rows(suite, h_patt, p->scan_adj)) {
@@ -1123,6 +1169,211 @@ static bool try_flip_n(HammerSuite *suite, HammerPattern *h_patt, MemoryBuffer *
 	fill_victim_rows(suite, h_patt);
 
     return false;  // 0/20 flips
+}
+
+// find_aggressor: identifies the true second aggressor for a known bit flip.
+//
+// Context: a flip has been observed at logical row x (d_vict.row) of bank y
+// (d_vict.bank), and logical row x+1 of the same bank is already known to
+// be one of the two real aggressors (d_partner). The actual pattern
+// hammered on every attempt is 19-sided, mirroring the hardcoded target
+// lists already used by n_sided_test/staggered_hammer_wrapper:
+//   d_lst[0]            = x+1              (known aggressor, fixed)
+//   d_lst[1]            = candidate         (the row under test, swept)
+//   d_lst[2..18]        = x+21,x+23,...,x+53 (17 fixed filler aggressors,
+//                                             stride 2, same on every attempt)
+// Only d_lst[1] changes between attempts, over x+{2..10} and x-{1..10} (19
+// candidates, same bank, skipping x and x+1 themselves) -- e.g. for
+// x=34498: 34499/34500/(34519,34521,...,34551), then
+// 34499/34501/(34519,...), ..., 34499/34497/(34519,...), etc. For every
+// candidate that reproduces the flip at x, it binary-searches (same
+// approach as n_sided_test/sweep_current_mapper) for the minimum round
+// count that still reliably flips the bit, then reports whichever
+// candidate needed the fewest rounds -- the pair most likely to be the
+// *true* aggressor pair rather than an incidental side effect of the
+// filler rows.
+void find_aggressor(HammerSuite * suite, DRAMAddr d_vict)
+{
+	MemoryBuffer *mem = suite->mem;
+	SessionConfig *cfg = suite->cfg;
+
+	d_vict.col = 0;
+	DRAMAddr d_partner = d_vict;
+	d_partner.row = d_vict.row + 1;	// already-confirmed aggressor
+
+	// dAddr_2_str returns a single static buffer, so results that need to
+	// outlive the next call (or appear together in one fprintf) must be
+	// copied out immediately.
+	char s_vict[64], s_partner[64];
+	strncpy(s_vict, dAddr_2_str(d_vict, ROW_FIELD | BK_FIELD), sizeof(s_vict));
+	s_vict[sizeof(s_vict) - 1] = '\0';
+	strncpy(s_partner, dAddr_2_str(d_partner, ROW_FIELD | BK_FIELD), sizeof(s_partner));
+	s_partner[sizeof(s_partner) - 1] = '\0';
+
+	enum { N_FILLER = 17, FA_PATT_LEN = 2 + N_FILLER };
+	DRAMAddr filler[N_FILLER];
+	for (int i = 0; i < N_FILLER; i++) {
+		filler[i] = d_vict;
+		filler[i].row = d_vict.row + 21 + 2 * i;	// x+21, x+23, ..., x+53
+	}
+
+	// d_vict/d_partner/filler are all fixed, absolute rows (hardcoded by
+	// the caller), but hugepage_sweep_test re-bases suite->mapper per
+	// hugepage/chunk -- skip this chunk entirely unless every one of them
+	// is actually mapped here, instead of wasting a pass hammering the
+	// wrong physical memory.
+	size_t map_lo = suite->mapper->base_row;
+	size_t map_hi = map_lo + cfg->h_rows;
+	bool in_range = d_vict.row >= map_lo && d_vict.row < map_hi &&
+	    d_partner.row >= map_lo && d_partner.row < map_hi;
+	for (int i = 0; in_range && i < N_FILLER; i++)
+		if (filler[i].row < map_lo || filler[i].row >= map_hi)
+			in_range = false;
+	if (!in_range) {
+		fprintf(stderr,
+			"[FIND_AGGR] victim=%s/partner=%s (+filler x+21..x+53) not in this chunk's mapped range, skipping\n",
+			s_vict, s_partner);
+		return;
+	}
+
+	// 19 candidates for d_lst[1]: x+2..x+10 (9) and x-1..x-10 (10).
+	int offsets[19];
+	int n_off = 0;
+	for (int o = 2; o <= 10; o++)
+		offsets[n_off++] = o;
+	for (int o = 1; o <= 10; o++)
+		offsets[n_off++] = -o;
+
+	HammerPattern h_patt;
+	h_patt.len = FA_PATT_LEN;
+	h_patt.rounds = cfg->h_rounds;
+	h_patt.d_lst = (DRAMAddr *) malloc(sizeof(DRAMAddr) * h_patt.len);
+	h_patt.d_lst[0] = d_partner;
+	for (int i = 0; i < N_FILLER; i++)
+		h_patt.d_lst[2 + i] = filler[i];
+
+	// try_flip_n's flip detection (like scan_rows below) goes through the
+	// global p->scan_adj. Bump it to at least 1 for the duration of the
+	// sweep so a candidate on the far side of d_partner -- where d_vict
+	// sits one row *outside* the [row_lo,row_hi] aggressor block -- still
+	// gets scanned, regardless of whatever -n/--scan-adj was passed on the
+	// command line.
+	size_t saved_scan_adj = p->scan_adj;
+	if (p->scan_adj < 1)
+		p->scan_adj = 1;
+
+	init_chunk_bank(suite, (int)d_vict.bank);
+	fprintf(stderr, "[FIND_AGGR] victim=%s known_aggr=%s (19-sided, filler x+21..x+53)\n",
+		s_vict, s_partner);
+
+	size_t best_rounds = (size_t) -1;
+	DRAMAddr best_cand = d_partner;
+	bool any_found = false;
+
+	for (int i = 0; i < n_off; i++) {
+		int64_t cand_row = (int64_t) d_vict.row + offsets[i];
+		if (cand_row < 0 ||
+		    (size_t) cand_row < suite->mapper->base_row ||
+		    (size_t) cand_row >= suite->mapper->base_row + cfg->h_rows)
+			continue;
+
+		DRAMAddr d_cand = d_vict;
+		d_cand.row = (size_t) cand_row;
+
+		char s_cand[64];
+		strncpy(s_cand, dAddr_2_str(d_cand, ROW_FIELD | BK_FIELD), sizeof(s_cand));
+		s_cand[sizeof(s_cand) - 1] = '\0';
+
+		h_patt.d_lst[1] = d_cand;
+		h_patt.rounds = cfg->h_rounds;
+
+		fprintf(stderr, "[FIND_AGGR] candidate %s + %s (+17 filler) -> vict %s: ",
+			s_cand, s_partner, s_vict);
+
+#ifdef FLIPTABLE
+		print_start_attack(&h_patt);
+#endif
+		for (int idx = 0; idx < h_patt.len; idx++)
+			fill_row(suite, &h_patt.d_lst[idx], cfg->d_cfg, 0);
+		fill_victim_rows(suite, &h_patt);
+
+		uint64_t time = hammer_it(&h_patt, mem, 0, 0, NULL, NULL, NULL);
+		fprintf(stderr, "%lu ", time);
+		bool flipped = scan_rows(suite, &h_patt, p->scan_adj);
+
+		for (int idx = 0; idx < h_patt.len; idx++)
+			fill_row(suite, &h_patt.d_lst[idx], cfg->d_cfg, 1);
+		fill_victim_rows(suite, &h_patt);
+
+#ifdef FLIPTABLE
+		print_end_attack();
+#endif
+
+		if (!flipped) {
+			fprintf(stderr, "no flip at %zu rounds\n", cfg->h_rounds);
+			continue;
+		}
+		fprintf(stderr, "FLIP\n");
+
+		size_t low = 1, high = cfg->h_rounds;
+		while ((high - low) > BIN_THRESH) {
+			size_t mid = (low + high) / 2;
+			h_patt.rounds = mid;
+			bool success = try_flip_n(suite, &h_patt, mem);
+			fprintf(stderr,
+				"[FIND_AGGR][BIN] cand=%s low=%zu mid=%zu high=%zu result=%d\n",
+				s_cand, low, mid, high, success);
+			if (success)
+				high = mid;
+			else
+				low = mid + 1;
+		}
+		h_patt.rounds = cfg->h_rounds;
+
+		fprintf(out_fd,
+			"[FIND_AGGR] cand=%s partner=%s vict=%s min_rounds~%zu (+/-%d)\n",
+			s_cand, s_partner, s_vict, high, BIN_THRESH);
+		fflush(out_fd);
+
+		any_found = true;
+		if (high < best_rounds) {
+			best_rounds = high;
+			best_cand = d_cand;
+		}
+	}
+
+	p->scan_adj = saved_scan_adj;
+	free(h_patt.d_lst);
+
+	if (any_found) {
+		char s_best[64];
+		strncpy(s_best, dAddr_2_str(best_cand, ROW_FIELD | BK_FIELD), sizeof(s_best));
+		s_best[sizeof(s_best) - 1] = '\0';
+
+		fprintf(stderr,
+			"[FIND_AGGR] BEST pair: %s + %s -> vict %s, min_rounds~%zu (+/-%d)\n",
+			s_best, s_partner, s_vict, best_rounds, BIN_THRESH);
+		fprintf(out_fd,
+			"[FIND_AGGR] BEST cand=%s partner=%s vict=%s min_rounds~%zu (+/-%d)\n",
+			s_best, s_partner, s_vict, best_rounds, BIN_THRESH);
+		fflush(out_fd);
+	} else {
+		fprintf(stderr,
+			"[FIND_AGGR] no candidate (out of %d tried) flipped vict %s at %zu rounds\n",
+			n_off, s_vict, cfg->h_rounds);
+	}
+}
+
+// hammer_test entry point for FIND_AGGRESSOR (see hammer_session's switch
+// and main.c's --find-aggressor flag). The victim is a fixed row/bank you
+// edit by hand here -- EDIT THIS to the bank/row of the flip you want to
+// re-derive the real aggressor pair for.
+int find_aggressor_wrapper(HammerSuite * suite)
+{
+	static const DRAMAddr d_vict = { .bank = 18, .row = 34498 };
+
+	find_aggressor(suite, d_vict);
+	return 0;
 }
 
 // Sweeps every row covered by suite->mapper (cfg->h_rows), across every bank,
@@ -1201,7 +1452,7 @@ static void sweep_current_mapper(HammerSuite *suite)
 				}
 			}
 
-			uint64_t time = hammer_it(&h_patt, mem, 0, 0, NULL, NULL);
+			uint64_t time = hammer_it(&h_patt, mem, 0, 0, NULL, NULL, NULL);
 			fprintf(stderr, "%ld ", time);
 
 			h_patt.rounds = cfg->h_rounds;
@@ -1424,8 +1675,8 @@ int n_sided_test(HammerSuite * suite)
 		// large gap into a "fill everything in between as victim" and
 		// stomps real aggressor rows with vpat.
 		static const DRAMAddr targets[] = {
+			// {.bank = 18, .row = 34529},
 			{.bank = 18, .row = 34499},
-			{.bank = 18, .row = 34529},
 			{.bank = 18, .row = 34531},
 			{.bank = 18, .row = 34533},
 			{.bank = 18, .row = 34535},
@@ -1492,7 +1743,7 @@ int n_sided_test(HammerSuite * suite)
 			// loop really is phase-locked to REF. If the same start_idx
 			// keeps flipping regardless of shift_ns, the effect is tied
 			// to the loop's own structure, not DRAM refresh timing.
-			static const bool rotate_pattern_start = false;
+			static const bool rotate_pattern_start = true;
 			static const bool phase_shift_inject   = false;
 			static uint64_t ps_tsc_hz = 0;
 			const uint64_t PHASE_SHIFT_STEPS = 11;
@@ -1533,16 +1784,21 @@ int n_sided_test(HammerSuite * suite)
 				}
 
 				uint64_t inner_delay = 0;
-				uint64_t outer_delay = 9000;
-				uint64_t time = hammer_it(&h_patt, mem, inner_delay, outer_delay, NULL, NULL);
+				uint64_t outer_delay = 0;
+				uint64_t time = hammer_it(&h_patt, mem, inner_delay, outer_delay, NULL, NULL, NULL);
 				fprintf(stderr, "%ld ", time);
 
 				h_patt.rounds = cfg->h_rounds;
-				if (scan_rows(suite, &h_patt, p->scan_adj)) {
+				bool attempt_flipped = scan_rows(suite, &h_patt, p->scan_adj);
+				if (attempt_flipped)
 					flipped = true;
-					fprintf(stderr, "[ROTATE] flip at attempt=%d start_idx=%zu shift_ns=%lu\n",
-						attempt, rot_off, shift_ns);
-				}
+				fprintf(stderr, "[ROTATE] attempt=%d start_idx=%zu shift_ns=%lu result=%s\n",
+					attempt, rot_off, shift_ns, attempt_flipped ? "FLIP" : "no-flip");
+#ifdef FLIPTABLE
+				fprintf(out_fd, "[ROTATE] attempt=%d start_idx=%zu shift_ns=%lu result=%s\n",
+					attempt, rot_off, shift_ns, attempt_flipped ? "FLIP" : "no-flip");
+				fflush(out_fd);
+#endif
 
 				// refill aggressors and dummies
 				for (int idx = 0; idx < h_patt.len; idx++)
@@ -1627,30 +1883,12 @@ static bool staggered_hammer_window(HammerSuite *suite, HammerPattern *h_patt,
         fill_row(suite, &h_patt->d_lst[idx], cfg->d_cfg, 0);
 
     /*
-     * Fill rows between aggressors as victims/dummies
-     * (only if same bank and increasing rows)
+     * Fill rows between aggressors as victims/dummies. h_patt->d_lst may
+     * not be sorted by row (targets[] can list rows in any order), so this
+     * must find gaps in row-sorted order, not list order -- fill_victim_rows
+     * already does exactly that (see its comment).
      */
-    for (int idx = 0; idx < h_patt->len - 1; idx++) {
-
-        DRAMAddr lo = h_patt->d_lst[idx];
-        DRAMAddr hi = h_patt->d_lst[idx + 1];
-
-        if (lo.bank != hi.bank)
-            continue;
-
-        if (hi.row <= lo.row + 1)
-            continue;
-
-        for (size_t dummy_row = lo.row + 1;
-             dummy_row < hi.row;
-             dummy_row++)
-        {
-            DRAMAddr d_dummy = lo;
-            d_dummy.row = dummy_row;
-
-            fill_row(suite, &d_dummy, cfg->d_cfg, 1);
-        }
-    }
+    fill_victim_rows(suite, h_patt);
 
     /*
      * CHANGE #1:
@@ -1862,8 +2100,8 @@ int staggered_hammer_wrapper(HammerSuite *suite)
 			{.bank = 18, .row = 34559},
 			{.bank = 18, .row = 34561},
 			{.bank = 18, .row = 34563},
-		// {.bank = 14, .row = 34539}, // comment out to try 19-sided hammering
-		// {.bank = 14, .row = 34541}, // comment out to try 20-sided hammering
+		// {.bank = 18, .row = 34565}, // comment out to try 19-sided hammering
+		// {.bank = 18, .row = 34567}, // comment out to try 20-sided hammering
 		// {.bank = 14, .row = 34543}, // comment out to try 21-sided hammering
 	};
 	size_t target_cnt = sizeof(targets) / sizeof(targets[0]);
@@ -1879,13 +2117,297 @@ int staggered_hammer_wrapper(HammerSuite *suite)
 	// inner_delay: cycles the aggressor thread waits between a0/a1/...
 	// activations. outer_delay: only used by HAMMER_FULL_SEND -- cycles
 	// the dummy thread waits between each full pass over its rows.
-	uint64_t inner_delay = 15000;
-	uint64_t outer_delay = 0;
+	uint64_t inner_delay = 16000;
+	uint64_t outer_delay = 12000;
 
 	if (target_cnt > 0)
 		return staggered_hammer(suite, targets, target_cnt, inner_delay, outer_delay, mode);
 
 	return staggered_hammer_scan(suite, inner_delay, outer_delay, mode);
+}
+
+// --- activation-threshold sweep -------------------------------------------
+//
+// Goal: for a FIXED set of aggressor rows (ACT_THRESH_TARGETS below -- edit
+// to a bank/row list you've already confirmed flips), find roughly how many
+// row activations inside a given wall-clock window are needed to see a bit
+// flip "somewhat regularly" -- the bar being at least 1 flip out of
+// ACT_TRIALS attempts.
+//
+// Two independent knobs are swept, in a full grid:
+//   - total # of rounds hammer_it() runs. One round = one access+flush of
+//     every row in ACT_THRESH_TARGETS, so this number IS the activation
+//     count per target row (not multiplied by how many targets there are).
+//   - total wall-clock time that run of `rounds` rounds should take.
+// hammer_it()'s outer_delay (a pause inserted after every round) is derived
+// from the two: outer_delay_ns ~= window_ns / rounds. This is an
+// approximation -- it ignores the (normally sub-microsecond) time the
+// access+flush of ACT_THRESH_TARGETS itself takes, so for small
+// windows/large round counts the real run can finish faster than requested
+// once outer_delay bottoms out at 0. To keep that visible, every logged
+// line reports hammer_it's *actual* measured total time next to the
+// requested window, instead of trusting the nominal number blindly.
+//
+// For every (window, rounds) cell: run ACT_TRIALS independent attempts,
+// each refilling aggressor/victim rows first (same refill/scan convention
+// as try_flip_n/staggered_hammer_window), and count how many flipped.
+// Logs one line per cell to out_fd (and stderr).
+//
+// Within a single attempt, the calibrated (window, rounds) pressure isn't
+// applied just once -- hammer_it() is re-run back-to-back
+// ACT_WINDOW_REPEATS times (same rounds/outer_delay each run, no
+// fill/scan in between) before scan_rows() checks for a flip. This spans
+// ACT_WINDOW_REPEATS consecutive windows (and however many refresh
+// intervals fall inside them) of uninterrupted hammering per check,
+// instead of judging a single window's pressure in isolation.
+#define ACT_TRIALS 10
+#define ACT_WINDOW_REPEATS 50
+
+// EDIT THIS: fixed target rows, single bank, sorted ascending (must stay
+// sorted -- fill_victim_rows/hPatt_row_bounds rely on it, same as
+// n_sided_test's targets[] above).
+static const DRAMAddr ACT_THRESH_TARGETS[] = {
+	{.bank = 18, .row = 34499},
+	{.bank = 18, .row = 34501},
+	{.bank = 18, .row = 34533},
+	{.bank = 18, .row = 34535},
+	{.bank = 18, .row = 34537},
+	{.bank = 18, .row = 34539},
+	{.bank = 18, .row = 34541},
+	{.bank = 18, .row = 34543},
+	{.bank = 18, .row = 34545},
+	{.bank = 18, .row = 34547},
+	{.bank = 18, .row = 34549},
+	{.bank = 18, .row = 34551},
+	{.bank = 18, .row = 34553},
+	{.bank = 18, .row = 34555},
+	{.bank = 18, .row = 34557},
+	{.bank = 18, .row = 34559},
+	{.bank = 18, .row = 34561},
+	{.bank = 18, .row = 34563},
+	{.bank = 18, .row = 34565},
+};
+
+// EDIT THIS: the two swept axes. Windows in microseconds, bracketing one
+// tREFW (8192 x 7.8us refreshes = ~64ms) from well under to well over;
+// rounds bracketing the activation counts classic rowhammer numbers fall
+// in (thousands to hundreds of thousands within one tREFW).
+static const uint64_t ACT_THRESH_WINDOWS_US[] = {
+	16000, 20000, 24000, 28000, 32000, 36000, 40000, 44000, 48000, 52000, 56000, 60000, 64000
+};
+static const uint64_t ACT_THRESH_ROUNDS[] = {
+	9000
+};
+
+// Runs one real hammer_it() probe at a given outer_delay and reports the
+// measured total elapsed time. Fills/restores aggressor and victim rows
+// around it and repairs (via scan_rows) any flip it causes, exactly like a
+// real ACT_TRIALS trial -- callers use this for calibration, so the result
+// doesn't count toward any flip tally.
+static uint64_t act_thresh_probe(HammerSuite *suite, HammerPattern *h_patt,
+				  MemoryBuffer *mem, uint64_t rounds,
+				  uint64_t outer_delay)
+{
+	SessionConfig *cfg = suite->cfg;
+	h_patt->rounds = rounds;
+
+	for (size_t idx = 0; idx < h_patt->len; idx++)
+		fill_row(suite, &h_patt->d_lst[idx], cfg->d_cfg, 0);
+	fill_victim_rows(suite, h_patt);
+
+	uint64_t rounds_done = 0;
+	uint64_t ns_per_round = hammer_it(h_patt, mem, 0, outer_delay,
+					   NULL, &rounds_done, NULL);
+	uint64_t actual_ns = ns_per_round * rounds_done;
+
+	scan_rows(suite, h_patt, p->scan_adj);
+	for (size_t idx = 0; idx < h_patt->len; idx++)
+		fill_row(suite, &h_patt->d_lst[idx], cfg->d_cfg, 1);
+	fill_victim_rows(suite, h_patt);
+
+	return actual_ns;
+}
+
+// Searches for an outer_delay (cycles) that makes one real hammer_it() run
+// of exactly `rounds` rounds take somewhere in [90%, 98%] of window_ns.
+// Exponential search outward from the naive window_ns/rounds guess brackets
+// the target band, then bisects within it. Every candidate is verified with
+// its own probe before being returned/kept, and the function only ever
+// returns a delay whose *measured* probe was <= the 98% ceiling -- so the
+// 50 real trials run against this delay can undershoot the window but
+// should never exceed it.
+//
+// hammer_it can't run faster than its own unpaced access+flush cost, so if
+// even outer_delay=0 (the floor) already overshoots the window, `rounds`
+// activations simply don't fit in `window_ns` on this hardware -- no
+// calibration can fix that. In that case *feasible is set to false and the
+// caller should skip the cell instead of running trials against a
+// calibration that's already bled past the window.
+#define ACT_CALIB_MAX_ITERS 20
+static uint64_t calibrate_outer_delay(HammerSuite *suite, HammerPattern *h_patt,
+				       MemoryBuffer *mem, uint64_t tsc_hz,
+				       uint64_t rounds, uint64_t window_ns,
+				       bool *feasible)
+{
+	uint64_t lo_ns = window_ns * 90 / 100;
+	uint64_t hi_ns = window_ns * 98 / 100;
+	*feasible = true;
+
+	uint64_t floor_ns = act_thresh_probe(suite, h_patt, mem, rounds, 0);
+	fprintf(stderr,
+		"[ACT_THRESH][CALIB] rounds=%lu probe outer_delay=0 actual_us=%lu target=[%lu,%lu]us\n",
+		rounds, floor_ns / 1000, lo_ns / 1000, hi_ns / 1000);
+	if (floor_ns > hi_ns) {
+		fprintf(stderr,
+			"[ACT_THRESH][CALIB] rounds=%lu INFEASIBLE: unpaced cost %luus already exceeds window %luus\n",
+			rounds, floor_ns / 1000, window_ns / 1000);
+		*feasible = false;
+		return 0;
+	}
+	if (floor_ns >= lo_ns)
+		return 0;	// zero delay already lands in band
+
+	uint64_t lo = 0, hi = 0;
+	bool have_hi = false;
+	uint64_t best_safe_delay = 0;	// highest delay confirmed <= hi_ns so far
+
+	uint64_t naive_ns_per_round = window_ns / rounds;
+	uint64_t outer_delay = (tsc_hz / 1000000000ULL) * naive_ns_per_round;
+	if (outer_delay == 0)
+		outer_delay = 1;
+
+	for (int iter = 0; iter < ACT_CALIB_MAX_ITERS; iter++) {
+		uint64_t actual_ns = act_thresh_probe(suite, h_patt, mem, rounds, outer_delay);
+
+		fprintf(stderr,
+			"[ACT_THRESH][CALIB] rounds=%lu probe outer_delay=%lu actual_us=%lu target=[%lu,%lu]us\n",
+			rounds, outer_delay, actual_ns / 1000, lo_ns / 1000, hi_ns / 1000);
+
+		if (actual_ns <= hi_ns && outer_delay > best_safe_delay)
+			best_safe_delay = outer_delay;
+
+		if (actual_ns >= lo_ns && actual_ns <= hi_ns)
+			return outer_delay;	// verified in-band, done
+
+		uint64_t next_delay;
+		if (actual_ns > hi_ns) {
+			hi = outer_delay;
+			have_hi = true;
+			next_delay = (lo + hi) / 2;
+		} else {
+			lo = outer_delay;
+			next_delay = have_hi ? (lo + hi) / 2 : outer_delay * 2;
+		}
+
+		if (next_delay == outer_delay)
+			break;	// bisection can't narrow any further
+		outer_delay = next_delay;
+	}
+
+	fprintf(stderr,
+		"[ACT_THRESH][CALIB] rounds=%lu did not land in band after %d probes, "
+		"using best verified-safe outer_delay=%lu (undershoot, never over window)\n",
+		rounds, ACT_CALIB_MAX_ITERS, best_safe_delay);
+	return best_safe_delay;
+}
+
+int activation_threshold_test(HammerSuite *suite)
+{
+	MemoryBuffer *mem = suite->mem;
+	SessionConfig *cfg = suite->cfg;
+
+	HammerPattern h_patt;
+	h_patt.len = sizeof(ACT_THRESH_TARGETS) / sizeof(ACT_THRESH_TARGETS[0]);
+	h_patt.d_lst = (DRAMAddr *) malloc(sizeof(DRAMAddr) * h_patt.len);
+	memcpy(h_patt.d_lst, ACT_THRESH_TARGETS, sizeof(ACT_THRESH_TARGETS));
+
+	if (!staggered_window_in_range(suite, h_patt.d_lst, (int)h_patt.len)) {
+		fprintf(stderr,
+			"[ACT_THRESH] targets not in this chunk's mapped range, skipping\n");
+		free(h_patt.d_lst);
+		return 0;
+	}
+
+	init_chunk_bank(suite, (int)h_patt.d_lst[0].bank);
+	fprintf(stderr, "[ACT_THRESH] targets=%s\n",
+		hPatt_2_str(&h_patt, ROW_FIELD | BK_FIELD));
+
+	uint64_t tsc_hz = measure_tsc_hz();
+	size_t n_windows = sizeof(ACT_THRESH_WINDOWS_US) / sizeof(ACT_THRESH_WINDOWS_US[0]);
+	size_t n_rounds  = sizeof(ACT_THRESH_ROUNDS) / sizeof(ACT_THRESH_ROUNDS[0]);
+
+	for (size_t wi = 0; wi < n_windows; wi++) {
+		uint64_t window_ns = ACT_THRESH_WINDOWS_US[wi] * 1000ULL;
+
+		for (size_t ri = 0; ri < n_rounds; ri++) {
+			uint64_t rounds = ACT_THRESH_ROUNDS[ri];
+
+			// Calibrate outer_delay against a handful of real runs
+			// first, so the ACT_TRIALS runs below land in [90%,98%]
+			// of window_ns instead of guessing a fixed fraction.
+			bool feasible = true;
+			uint64_t outer_delay = calibrate_outer_delay(suite, &h_patt, mem,
+								      tsc_hz, rounds, window_ns,
+								      &feasible);
+			if (!feasible) {
+				fprintf(stderr,
+					"[ACT_THRESH] window=%luus rounds=%lu SKIPPED (infeasible: "
+					"unpaced run already exceeds window)\n",
+					window_ns / 1000, rounds);
+				fprintf(out_fd,
+					"[ACT_THRESH] window_us=%lu rounds=%lu INFEASIBLE aggr=%s\n",
+					window_ns / 1000, rounds,
+					hPatt_2_str(&h_patt, ROW_FIELD | BK_FIELD));
+				fflush(out_fd);
+				continue;
+			}
+
+			int flips = 0;
+			uint64_t total_ns_sum = 0;
+
+#ifdef FLIPTABLE
+			print_start_attack(&h_patt);
+#endif
+			for (int trial = 0; trial < ACT_TRIALS; trial++) {
+				for (size_t idx = 0; idx < h_patt.len; idx++)
+					fill_row(suite, &h_patt.d_lst[idx], cfg->d_cfg, 0);
+				fill_victim_rows(suite, &h_patt);
+
+				h_patt.rounds = rounds;
+				for (int w = 0; w < ACT_WINDOW_REPEATS; w++) {
+					uint64_t rounds_done = 0;
+					uint64_t ns_per_round = hammer_it(&h_patt, mem, 0, outer_delay,
+									   NULL, &rounds_done, NULL);
+					total_ns_sum += ns_per_round * rounds_done;
+				}
+
+				if (scan_rows(suite, &h_patt, p->scan_adj))
+					flips++;
+
+				for (size_t idx = 0; idx < h_patt.len; idx++)
+					fill_row(suite, &h_patt.d_lst[idx], cfg->d_cfg, 1);
+				fill_victim_rows(suite, &h_patt);
+			}
+#ifdef FLIPTABLE
+			print_end_attack();
+#endif
+
+			// avg_actual_ns spans all ACT_WINDOW_REPEATS back-to-back
+			// windows of one trial, not a single window.
+			uint64_t avg_actual_ns = total_ns_sum / ACT_TRIALS;
+			fprintf(stderr,
+				"[ACT_THRESH] window=%luus reps=%d rounds=%lu actual=%luus flips=%d/%d\n",
+				window_ns / 1000, ACT_WINDOW_REPEATS, rounds, avg_actual_ns / 1000, flips, ACT_TRIALS);
+			fprintf(out_fd,
+				"[ACT_THRESH] window_us=%lu reps=%d rounds=%lu actual_us=%lu flips=%d trials=%d aggr=%s\n",
+				window_ns / 1000, ACT_WINDOW_REPEATS, rounds, avg_actual_ns / 1000, flips, ACT_TRIALS,
+				hPatt_2_str(&h_patt, ROW_FIELD | BK_FIELD));
+			fflush(out_fd);
+		}
+	}
+
+	free(h_patt.d_lst);
+	return 0;
 }
 
 void fuzz(HammerSuite *suite, int d, int v)
@@ -1930,7 +2452,7 @@ void fuzz(HammerSuite *suite, int d, int v)
 		for (int idx = 0; idx < h_patt.len; idx++)
 			fill_row(suite, &h_patt.d_lst[idx], suite->cfg->d_cfg, 0);
 
-		uint64_t time = hammer_it(&h_patt, suite->mem, 0, 0, NULL, NULL);
+		uint64_t time = hammer_it(&h_patt, suite->mem, 0, 0, NULL, NULL, NULL);
 		fprintf(stderr, "%lu ",time);
 
 		scan_rows(suite, &h_patt, p->scan_adj);
@@ -2105,11 +2627,17 @@ void hammer_session(SessionConfig * cfg, MemoryBuffer * memory)
 			suite->hammer_test = (int (*)(void *))n_sided_test;
 			break;
 		}
+		case ACTIVATION_THRESH:
+			suite->hammer_test = (int (*)(void *))activation_threshold_test;
+			break;
 		case DELAYED:
 			suite->hammer_test = (int (*)(void *))staggered_hammer_wrapper;
 			break;
 		case SWEEP_ALL:
 			suite->hammer_test = (int (*)(void *))sweep_current_mapper;
+			break;
+		case FIND_AGGRESSOR:
+			suite->hammer_test = (int (*)(void *))find_aggressor_wrapper;
 			break;
 		default:
 		{
